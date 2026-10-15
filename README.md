@@ -2,21 +2,25 @@
 
 A script for driving an OpenCode server over HTTP and SSE.
 
-**You do not need to deploy a server.** `OPENCODE_HOST` is just a URL. Point it at
-an `opencode serve` running on this machine, on a laptop, or at an instance someone
-else already runs:
+**Point it at a local opencode instance, or at a server running opencode.** You do
+not have to deploy one yourself.
 
 ```bash
+# a local instance, on this machine
 export OPENCODE_HOST='http://127.0.0.1:4096'
+
+# or a server running opencode, anywhere
+export OPENCODE_HOST='http://<server-host>:4096'
+
 export OPENCODE_PASS='anything'     # sent as Basic auth; ignored if the server has none
 ```
 
-[server.md](./server.md) is one way to stand up a long-lived server on a Proxmox
-LXC. It is a deployment guide, not a prerequisite — the tool knows nothing about
-Proxmox, systemd, or your LAN.
+[server.md](./server.md) is one way to stand up a server on a Proxmox LXC. It is a
+deployment guide, not a prerequisite — the tool knows nothing about Proxmox, systemd,
+or your LAN.
 
 See [Pointing somewhere else](#pointing-somewhere-else) if you use more than one
-server.
+target.
 
 | File | |
 |---|---|
