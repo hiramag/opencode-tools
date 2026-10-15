@@ -383,6 +383,14 @@ not in the `shadow` group).
 
 True read isolation would require a chroot (`RootDirectory=`) or bubblewrap, both
 of which break the runtime — the binary needs libc, `/dev/urandom` and `/proc`.
+A weaker middle option is `TemporaryFileSystem=/` plus `BindReadOnlyPaths` for
+each path the binary genuinely needs, which gives chroot-style isolation without a
+full chroot. That one is untested here; see **Outstanding** for what closing it
+would take.
+
+Note this is the read side only. Whether the container can reach *out* is a
+separate question, and the answer is yes — see **Egress is unrestricted** under
+Outstanding.
 
 ### Defence layers actually present
 
@@ -864,6 +872,22 @@ that same capability, delivered as a QR code. Do not treat scanning one as casua
   `TemporaryFileSystem=/` with `BindReadOnlyPaths` for each readable directory
   gives chroot-style read isolation. Needs a verification loop before it is
   trusted.
+- **Egress is unrestricted.** The boundary is one-directional: the container
+  firewall controls what may reach the server, but nothing limits where the
+  server may reach out. `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+  AF_NETLINK` constrains which socket *families* can be created, not which
+  destinations they may connect to, and `AF_INET` is present — so an agent
+  asked to fetch a URL will reach the public internet. This was observed, not
+  inferred: the agent returned a public IP address. To close it:
+  ```ini
+  IPAddressDeny=any
+  IPAddressAllow=localhost
+  IPAddressAllow=<lan-subnet>
+  ```
+  Needs the same verification loop as read containment, with one extra
+  hazard: a denied egress breaks the model's own API call, so a wrong allow
+  list looks like a broken model rather than a blocked network. Verify with a
+  deliberate outbound fetch before trusting it.
 - **The `status=9/KILL` at 2026-10-14 19:47:54.** An external SIGKILL — manual
   `kill -9` or the OOM killer. Unexplained. Check:
   ```bash
