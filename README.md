@@ -1,10 +1,22 @@
 # opencode-bash-tool.sh
 
-The **client** half of this setup: a script for driving an OpenCode server over
-HTTP and SSE from any machine on the LAN.
+A script for driving an OpenCode server over HTTP and SSE.
 
-For the server itself — systemd unit, hardening, verification — see
-[server.md](./server.md).
+**You do not need to deploy a server.** `OPENCODE_HOST` is just a URL. Point it at
+an `opencode serve` running on this machine, on a laptop, or at an instance someone
+else already runs:
+
+```bash
+export OPENCODE_HOST='http://127.0.0.1:4096'
+export OPENCODE_PASS='anything'     # sent as Basic auth; ignored if the server has none
+```
+
+[server.md](./server.md) is one way to stand up a long-lived server on a Proxmox
+LXC. It is a deployment guide, not a prerequisite — the tool knows nothing about
+Proxmox, systemd, or your LAN.
+
+See [Pointing somewhere else](#pointing-somewhere-else) if you use more than one
+server.
 
 | File | |
 |---|---|
@@ -21,7 +33,7 @@ For the server itself — systemd unit, hardening, verification — see
 | `curl` | All HTTP. Preinstalled on macOS and most Linux |
 | **`jq`** | **Required.** Parses SSE event payloads and builds request bodies |
 | `base64` | Builds the Basic auth header. Preinstalled on macOS and most Linux |
-| `opencode` | Only for `selftest`, which starts a local server. Not needed otherwise |
+| `opencode` | Only if you run your own server, and for `selftest`, which starts a local one. Not needed when you point at an instance that already exists |
 `jq` is a hard dependency, not optional. The script parses model output from the
 event stream — arbitrary text containing quotes, escapes and newlines — and
 constructs JSON request bodies from your prompt. `sed` and `grep` cannot do that
@@ -448,6 +460,67 @@ by design.** To see the raw stream including heartbeats:
 ```bash
 curl -sN -H "Authorization: Basic $AUTH" "$OPENCODE_HOST/api/event"
 ```
+
+---
+
+## Pointing somewhere else
+
+`OPENCODE_HOST` is the only thing that decides which server you talk to. Change it
+and everything else follows — nothing in the script is tied to a LAN, a Proxmox
+host, or a particular subnet.
+
+| Target | Value |
+|---|---|
+| This machine | `export OPENCODE_HOST='http://127.0.0.1:4096'` |
+| A laptop on the same network | `export OPENCODE_HOST='http://<laptop-host>:4096'` |
+| A shared or remote instance | `export OPENCODE_HOST='https://<host>'` |
+| A throwaway, for checking the tool works | `./opencode-bash-tool.sh selftest` |
+
+### Containment follows the server
+
+Sessions may only be created **under the target's own working directory**, and the
+tool reads that from the server rather than assuming it. Point at a local opencode
+and the boundary becomes whatever that process's working directory is — it is not
+`/projects` unless that server was set up that way.
+
+If the working directory cannot be read, the tool refuses to create anything rather
+than guessing.
+
+### One library, several servers
+
+`~/.opencode/sessions/` is a single shared store. Records do record which host they
+belong to, and `use` tells you when you switch to a session recorded against a
+different host — but `ls` has no host column, so a listing can mix servers.
+
+Worse, name collisions are checked **on the name alone**. A session called `work` on
+one server blocks `work` on another, and the refusal will not say which server owns
+it.
+
+The fix is a separate library per target:
+
+```bash
+export SESSIONS_DIR=~/.opencode/sessions-local
+```
+
+Or use distinct names. Nothing else needs to change.
+
+### Authentication
+
+`OPENCODE_PASS` is required and is always sent as an HTTP Basic header. There are no
+fallbacks by design. If the target server needs no password it ignores the header, so
+any value works — but leaving the variable unset is a hard error, not a silent
+anonymous request.
+
+### Proving it without setting anything up
+
+```bash
+./opencode-bash-tool.sh selftest
+```
+
+Starts its own `opencode serve` on `127.0.0.1`, points the tool at it, and runs the
+whole path — connection, session creation, model listing, model switch, prompt
+round-trip. Nothing else on the machine is touched, and the server is torn down
+afterwards. If that passes, pointing at a local or laptop instance will too.
 
 ---
 
