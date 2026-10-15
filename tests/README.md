@@ -12,14 +12,14 @@ Needs `jq`; nothing here touches the network or your server.
 
 Three questions, all about the fiddly decisions the script makes.
 
-**When you create a session, what do we call it?** You type `/projects/ha` and
-the script has to invent a name. It takes the last piece of the path — `ha`. The
+**When you create a session, what do we call it?** You type `/projects/api` and
+the script has to invent a name. It takes the last piece of the path — `api`. The
 cases check that a trailing slash doesn't break it, that `/a/b/c/path` gives
 `path`, and that a bare `/` — no last piece to use — falls back to a timestamp
 rather than an empty name.
 
 **Can you only create sessions inside `/projects`?** The server's working
-directory is meant to be a hard wall. `/projects` and `/projects/ha` are allowed;
+directory is meant to be a hard wall. `/projects` and `/projects/api` are allowed;
 `/etc`, `/`, and `/projects2` are refused. That last one matters: `/projects2`
 begins with the same characters, so a lazy prefix check would wave it through.
 

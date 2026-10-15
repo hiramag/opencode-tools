@@ -28,17 +28,17 @@ section "session_file accepts a name or an id"
 
 fresh_store
 put_session probe     ses_probe123  /projects
-put_session ha        ses_ha456     /projects/ha
-put_session tidy      ses_tidy789   /projects/cfengine
+put_session api        ses_api456     /projects/api
+put_session tidy      ses_tidy789   /projects/notes
 
-assert_eq "by name"        "ha" "$(basename "$(session_file ha)" .json)"
-assert_eq "by session id"  "ha" "$(basename "$(session_file ses_ha456)" .json)"
+assert_eq "by name"        "api" "$(basename "$(session_file api)" .json)"
+assert_eq "by session id"  "api" "$(basename "$(session_file ses_api456)" .json)"
 assert_rc "unknown name is a miss"   1 session_file nosuch
 assert_rc "unknown id is a miss"     1 session_file ses_nosuch
 
 section "session_name_for"
 
-assert_eq "resolves an id to a name"  "ha"    "$(session_name_for ses_ha456)"
+assert_eq "resolves an id to a name"  "api"    "$(session_name_for ses_api456)"
 assert_eq "an untracked id stays itself" "ses_zzz" "$(session_name_for ses_zzz)"
 
 # ------------------------------------------------------- derived "current"
@@ -49,7 +49,7 @@ section "sid_of derives the current session"
 
 fresh_store
 put_session older  ses_older  /projects "" 2026-01-01T00:00:00Z 2026-03-01T00:00:00Z
-put_session newer  ses_newer  /projects/ha "" 2026-01-02T00:00:00Z 2026-09-09T00:00:00Z
+put_session newer  ses_newer  /projects/api "" 2026-01-02T00:00:00Z 2026-09-09T00:00:00Z
 assert_eq "newest last_used wins" "ses_newer" "$(sid_of)"
 
 put_session oldest ses_oldest /projects "" 2025-01-01T00:00:00Z 2020-01-01T00:00:00Z

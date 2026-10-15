@@ -12,10 +12,10 @@
 
 section "session_derive_name"
 
-assert_eq "explicit --as wins"            tidy       "$(session_derive_name /projects/cfengine tidy)"
-assert_eq "basename of a plain path"      ha         "$(session_derive_name /projects/ha '')"
+assert_eq "explicit --as wins"            tidy       "$(session_derive_name /projects/notes tidy)"
+assert_eq "basename of a plain path"      api        "$(session_derive_name /projects/api '')"
 assert_eq "last segment of a deep path"   path       "$(session_derive_name /a/b/c/path '')"
-assert_eq "trailing slash is stripped"    ha         "$(session_derive_name /projects/ha/ '')"
+assert_eq "trailing slash is stripped"    api        "$(session_derive_name /projects/api/ '')"
 assert_eq "double slash is stripped"      projects   "$(session_derive_name //projects '')"
 assert_eq "bare / falls back to a stamp"  "$(date -u +%Y%m%d-%H%M)" \
                                            "$(session_derive_name / '')"
@@ -33,14 +33,14 @@ assert_eq "an empty dir falls back to a stamp" "$(date -u +%Y%m%d-%H%M)" \
 section "under_root"
 
 assert_rc "the root itself is inside"     0 under_root /projects /projects
-assert_rc "a child is inside"             0 under_root /projects/ha /projects
+assert_rc "a child is inside"             0 under_root /projects/api /projects
 assert_rc "a deep child is inside"        0 under_root /projects/a/b/c /projects
 assert_rc "a sibling is OUTSIDE"          1 under_root /projects2 /projects
 assert_rc "a sibling prefix is OUTSIDE"   1 under_root /projects-secret /projects
 assert_rc "the parent is OUTSIDE"         1 under_root / /projects
 assert_rc "/etc is OUTSIDE"               1 under_root /etc /projects
 assert_rc "trailing slashes are equal"    0 under_root /projects/ /projects
-assert_rc "child with trailing slash"     0 under_root /projects/ha/ /projects/
+assert_rc "child with trailing slash"     0 under_root /projects/api/ /projects/
 
 # Origin: macOS reports /private/var/... while you type /var/...; a pure string
 # comparison called the server's own working directory outside itself.

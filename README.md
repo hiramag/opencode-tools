@@ -53,6 +53,41 @@ apt install jq           # Debian/Ubuntu, including the server
 
 ---
 
+## Security
+
+Read this before exposing anything to a network you do not fully control.
+
+**The transport is plain HTTP.** `OPENCODE_HOST` is whatever URL you give it, and
+the examples here are `http://`. Authentication is HTTP Basic — a base64 string,
+which is encoding, not encryption. Anyone able to observe the traffic can recover
+the password from it. This is acceptable on a trusted LAN and nothing else.
+
+**If you deploy the server**, its containment is one-directional and partial.
+`server.md` documents this in full; the short version:
+
+| | |
+|---|---|
+| Writes | Confined to the server's working directory by systemd |
+| Reads | **Not confined.** Any file the service account can read, it can read |
+| Outbound network | **Unrestricted.** The agent can reach the public internet |
+
+Deploying it to an untrusted network without putting HTTPS in front is not a good
+idea.
+
+**This client is unprivileged.** It needs no root, writes only to
+`~/.opencode/sessions/`, and makes no changes to the target beyond creating,
+modelling and deleting sessions you explicitly ask for. It sends your prompt text
+and receives model output; that traffic goes wherever `OPENCODE_HOST` points.
+
+**`selftest` is the exception worth knowing about**: it binds a throwaway server to
+`127.0.0.1` on a random port and removes it afterwards. Nothing else on the
+machine is touched.
+
+If you need this over anything but a trusted network, terminate TLS in front of the
+server and point `OPENCODE_HOST` at `https://`.
+
+---
+
 ## Is it connected?
 
 One command, and it names the failure rather than printing nothing:
@@ -82,15 +117,33 @@ clears nothing. `session` shows `none` only before your first `new`.
 
 ---
 
+## Try it in thirty seconds
+
+No server, no configuration, no account. This starts a throwaway `opencode` on
+localhost, runs the whole path against it, and tears it down:
+
+```bash
+git clone https://github.com/hiramag/opencode-tools.git
+cd opencode-tools
+
+brew install jq              # the only hard dependency
+./opencode-bash-tool.sh selftest
+
+./tests/run.sh               # the unit suites; also needs no server
+```
+
+`selftest` prints which checks passed and reports a non-zero exit if any fail. If
+that works, the tool is fine and the only thing left is choosing a server.
+
 ## Quick start
 
-Set the four required variables first — see [Configuration](#configuration).
-Start with `ping` to confirm the connection before anything else.
+Now point it at a server. Set the two required variables — see
+[Configuration](#configuration) — and confirm the connection before anything else.
 
 ```bash
 ./opencode-bash-tool.sh ping                                 # reachable + authenticated
-./opencode-bash-tool.sh models bunny                         # what can this server run?
-./opencode-bash-tool.sh new /projects                        # session on the server's default model
+./opencode-bash-tool.sh models <filter>                      # what can this server run?
+./opencode-bash-tool.sh new <path>                           # session on the server's default model
 ./opencode-bash-tool.sh ask "explain this repo"              # reply appears here
 ```
 
@@ -249,7 +302,7 @@ been typed into shared terminals, committed, or pasted anywhere.
 There is **one store**, in `~/.opencode/sessions`, one JSON file per session:
 
 ```json
-{"id":"ses_ec...","directory":"/projects/ha","model":"opencode/space-bunny-free",
+{"id":"ses_<id>","directory":"<server-workdir>/<name>","model":"<provider>/<model>",
  "created":"2026-10-14T22:55:35Z","last_used":"2026-10-14T23:10:00Z",
  "host":"http://<server-host>:4096"}
 ```
@@ -271,9 +324,9 @@ server too.
 ### Every session gets a name
 
 ```bash
-./opencode-bash-tool.sh new /projects/ha          # -> ha
-./opencode-bash-tool.sh new /projects/cfengine --as tidy   # -> tidy
-./opencode-bash-tool.sh new /                     # -> 20261014-1642, no basename to use
+./opencode-bash-tool.sh new <server-workdir>/api   # -> api
+./opencode-bash-tool.sh new <server-workdir>/notes --as tidy   # -> tidy
+./opencode-bash-tool.sh new /                     # -> 20260101-0000, no basename to use
 ```
 
 A name is derived from the directory's last segment unless `--as` says otherwise,
@@ -282,11 +335,11 @@ so a session can never exist on the server without being findable here.
 **A taken name is refused, not suffixed:**
 
 ```
-$ ./opencode-bash-tool.sh new /projects/ha
-a session named "ha" already exists  (ses_ec310a1..., /projects/ha)
+$ ./opencode-bash-tool.sh new <server-workdir>/api
+a session named "api" already exists  (ses_<id>..., <server-workdir>/api)
 
-use ha                    continue it
-new /projects/ha --as ha2 start a separate one
+use api                   continue it
+new <server-workdir>/api --as api2 start a separate one
 ```
 
 Nothing is created and nothing is attached. The two outcomes — continue old
@@ -314,9 +367,9 @@ string prefix.
 ### `ls`
 
 ```
-NAME              ID                                DIRECTORY        MSGS  MODEL  LAST_USED
-ha                ses_ec33e42c8ffev8kOCCIxTnlHJk  /projects/ha       12  -      2026-10-14 23:10 *
-probe             ses_ec35f2be1ffeGMHI0DNWKFb829  /projects           4  -      2026-10-14 22:55
+NAME              ID                                DIRECTORY               MSGS  MODEL  LAST_USED
+api               ses_<id>                        <server-workdir>/api      12  -      2026-01-01 23:10 *
+probe             ses_<id>                        <server-workdir>          4  -      2026-01-01 22:55
 ```
 
 `MSGS` is the message count, because a session that has grown to hundreds of
@@ -654,7 +707,7 @@ Worth keeping, because each one failed silently or misleadingly.
    text at all — indistinguishable from a broken client. Always pass the model:
 
    ```bash
-   ./opencode-bash-tool.sh new /projects space-bunny-free
+   ./opencode-bash-tool.sh new <path> <model-id>
    ```
 
 9. **When output is blank, run `history`.** It is ground truth: it shows the exact
