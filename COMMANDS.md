@@ -33,7 +33,7 @@ Every example uses placeholders, not a real machine's values. Substitute before 
 | `<password>` | the server account password | *(never shown here)* |
 | `<name>` | a session name you chose | `research` |
 | `ses_<id>` | a server-assigned session id | `ses_000000000000` |
-| `<path>` | an absolute path on the **server's** filesystem | `/projects` |
+| `<path>` | an absolute path on the **target's** filesystem, under its working directory | `/projects` (an example, not a fixed value) |
 | `<model-id>` | a model identifier, no provider prefix | `some-model` |
 | `<provider-id>` | a provider identifier | `opencode` |
 | `<pattern>` | a shell glob, anchored at the start | `res*` |
@@ -55,13 +55,21 @@ They ignore everything after the subcommand.
 
 ## Configuration
 
-Two variables are required. There are **no fallbacks** — a missing value is a hard
-error, never a silent default.
+**Point it at a local opencode instance, or at a server running opencode.** You do
+not have to deploy one yourself.
 
 ```bash
+# a local instance, on this machine
+export OPENCODE_HOST='http://127.0.0.1:<port>'
+
+# or a server running opencode, anywhere
 export OPENCODE_HOST='http://<server-host>:<port>'
+
 export OPENCODE_PASS='<password>'
 ```
+
+Two variables are required. There are **no fallbacks** — a missing value is a hard
+error, never a silent default.
 
 `OPENCODE_HOST` **must** include both the scheme and the port. Without them curl
 defaults to port 80 and hangs:
@@ -76,6 +84,19 @@ defaults to port 80 and hangs:
 collide with the standard shell parameter of the same name that holds your machine's
 hostname, which corrupts the shell prompt. The tool will not accept the old `HOST`
 or `PASS` names; it fails loudly and tells you which variable is missing.
+
+Everything below this line works the same against either target. Two things do
+change with the choice, and both are in [Pointing somewhere
+else](README.md#pointing-somewhere-else):
+
+- the containment boundary is read from the target, so it is that server's working
+  directory rather than a fixed path
+- one `~/.opencode/sessions/` library is shared across targets, and name collisions
+  are keyed on the name alone — set `SESSIONS_DIR` per target to keep them apart
+
+`./opencode-bash-tool.sh selftest` starts its own `opencode serve` on `127.0.0.1`
+and exercises the whole path against it, so you can confirm the tool works before
+pointing it anywhere.
 
 ---
 
