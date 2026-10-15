@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Editors
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local environment. The real one lives in your home directory, but keep this
+# in case anyone copies it in: it holds the server password.
+opencode-server.env
+opencode-server.env.*
+*.env
