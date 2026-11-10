@@ -183,6 +183,25 @@ anything you intend to read as a pass/fail.
 ./opencode-bash-tool.sh info | jq '.version'
 ```
 
+What it looks like:
+
+```json
+{
+  "version": "2.2.6",
+  "pid": 29265,
+  "hostname": "linux.home.arpa",
+  "urls": [
+    "http://127.0.0.1:4096"
+  ],
+  "paths": {
+    "tmp": "/var/folders/.../T/opencode"
+  },
+  "capabilities": {
+    "persistentPty": true
+  }
+}
+```
+
 ---
 
 ### `new`
@@ -366,28 +385,65 @@ pointing at the wrong machine.
 
 ### `ask`
 
-Send a prompt to the current session.
+Ask the model. One-shot by default: no session, no history, no event stream.
 
 ```
-ask [--live|--wait|--raw] "<text>"
+ask [--model <id>] [--provider <id>] "<text>"
+ask --live|--wait|--raw "<text>"          # run in the saved session
+```
+
+#### One-shot (default)
+
+`ask "text"` calls `POST /api/experimental/generate/text` and prints `.data.text`.
+It creates no session and keeps no history, so there is no multi-turn context.
+The server's base model is used unless `--model` names another one; `--provider`
+defaults to `opencode`.
+
+The model still needs quota. A free model over its limit returns
+`ProviderRequestError` / `rate_limit`, and the server's error body is printed as-is.
+
+```bash
+./opencode-bash-tool.sh ask "why is the sky blue?"
+./opencode-bash-tool.sh ask --model deepseek-v4.1-flash "why is the sky blue?"
+```
+
+#### Session modes
+
+`--live`, `--wait` and `--raw` opt back into the saved session's agent, stream and
+history. Use them when the request needs tools, project files, or earlier turns.
+
+| Mode | Behaviour |
+|---|---|
+| none | One-shot; stateless, no session |
+| `--live` | Run in the saved session and stream the reply |
+| `--wait` | Run in the saved session, print the reply once complete |
+| `--raw` | Run in the saved session, print raw SSE frames |
+
+`ASK_MODE` in the environment selects a session mode when no flag is given. Leave
+it unset for the one-shot default.
+
+`ASK_SILENCE` applies to the session modes: how many seconds of event silence `ask`
+tolerates before giving up with exit status 2 (default `60`). Raise it for a slow
+model: `ASK_SILENCE=120 ./opencode-bash-tool.sh ask --wait "your message"`.
+
+`--model` works here too, but differently. In the one-shot form it applies to that
+call. In a session mode the model belongs to the session, so the script switches
+the session's model first and prints a note — the change persists for later turns.
+
+```bash
+./opencode-bash-tool.sh ask --raw --model deepseek-v4.1-flash "what is this repo?"
+# session ses_... now uses opencode/deepseek-v4.1-flash
+# note: the session model changed; it persists for later asks
 ```
 
 #### Arguments
 
 | Position | Argument | Required | Notes |
 |---|---|---|---|
-| 1 | `--live` \| `--wait` \| `--raw` | no | Output mode. May be repeated; the last one wins. |
-| 2..n | `<text>` | yes | Every remaining word, joined with single spaces |
-
-#### Modes
-
-| Mode | Behaviour |
-|---|---|
-| `--live` | Stream the reply as it is written (default) |
-| `--wait` | Print the reply once, when complete |
-| `--raw` | Print raw SSE frames instead of a rendered reply |
-
-`ASK_MODE` in the environment sets the default mode when no flag is given.
+| | `--model <id>` | no | Model for the call. In a session mode, switches the session's model first |
+| | `--provider <id>` | no | Provider for `--model`; defaults to `opencode` |
+| | `--live` \| `--wait` \| `--raw` | no | Session mode. May be repeated; the last wins. |
+| 1..n | `<text>` | yes | Every remaining word, joined with single spaces |
 
 #### Your message is every remaining word
 
@@ -409,9 +465,66 @@ If no text is given at all, the tool says so and exits rather than sending nothi
 #### Examples
 
 ```bash
-./opencode-bash-tool.sh ask "what is in this directory?"
+./opencode-bash-tool.sh ask "why is the sky blue?"
+./opencode-bash-tool.sh ask --model deepseek-v4.1-flash "summarise this API"
 ./opencode-bash-tool.sh ask --wait "summarise the README"
 ./opencode-bash-tool.sh ask --raw "show me the raw frames"
+```
+
+#### Worked example: the free limit
+
+Free models have a quota. When it is spent, the server returns an error and `ask`
+prints the body unchanged — there is no retry and no silent fallback:
+
+```
+% ./opencode-bash-tool.sh ask "why is the sky blue?"
+error: ask failed (HTTP 502)
+server said: {"_tag":"ProviderRequestError","providerID":"opencode","reason":"rate_limit",
+"message":"Free usage limit reached. Free models work in OpenCode (https://opencode.ai);
+subscribe to OpenCode Go to keep going: https://opencode.ai/go","status":429,
+"retryAfterMs":4158000}
+```
+
+`retryAfterMs` is the wait before the free quota resets. Naming a paid model works
+immediately, without a server restart:
+
+```
+% ./opencode-bash-tool.sh ask --model deepseek-v4.1-flash --provider opencode "why is the sky blue?"
+The sky looks blue mainly because of **Rayleigh scattering**.
+...
+```
+
+The reply above contains LaTeX (`\(1/\lambda^4\)`). The tool prints the server's
+text as-is, so markdown and LaTeX stay literal in a terminal — nothing here
+renders them. That is expected output, not a decoding bug.
+
+---
+
+### `raw-ask`
+
+Ask the model one-shot and print the server's response body verbatim.
+
+```
+raw-ask [--model <id>] [--provider <id>] "<text>"
+```
+
+Same endpoint and same stateless behaviour as `ask` without a session flag, but
+the body is printed exactly as the server sent it — typically
+`{"data":{"text":"..."}}` — instead of extracting `.data.text`.
+
+Useful when a reply is empty or its shape is unclear: `ask` prints
+`server returned no text` plus the body in that case, and `raw-ask` shows the
+shape on success as well.
+
+`--live`, `--wait` and `--raw` are `ask`'s session modes and are rejected here.
+For SSE frames, use `ask --raw` against the saved session.
+
+**Arguments:** `<text>` — every remaining word, joined with single spaces.
+**Flags:** `--model <id>`, `--provider <id>` (same meanings as `ask`).
+
+```bash
+./opencode-bash-tool.sh raw-ask "why is the sky blue?"
+./opencode-bash-tool.sh raw-ask --model deepseek-v4.1-flash "summarise this API"
 ```
 
 ---
@@ -502,6 +615,24 @@ tool says so on success.
 ./opencode-bash-tool.sh model <model-id>
 ./opencode-bash-tool.sh model <model-id> <provider-id>
 ```
+
+#### Bare id vs `provider/model`
+
+Commands and the config file want different strings:
+
+| Where | Format | Example |
+|---|---|---|
+| This tool, and the API (`/api/model`) | bare id | `deepseek-v4.1-flash` |
+| `opencode.json`, `"model"` | provider/id | `opencode/deepseek-v4.1-flash` |
+
+A bare id in the config is **silently discarded**. The server logs one `WARN` and
+then runs with no default model at all. Check after any config change:
+
+```bash
+grep 'normalization diagnostic' ~/.local/share/opencode/log/opencode.log | tail -3
+```
+
+No output means it is clean. See [server.md](./server.md) for the server-side fix.
 
 ---
 
@@ -690,6 +821,33 @@ cleanly. Unlike `watch`, nothing is filtered.
 ./opencode-bash-tool.sh raw -i      # headers first, then frames
 ```
 
+#### When to use it
+
+It is the only command that shows what the server emits **before** any filtering.
+That makes it a monitor and a diagnostic, not something to build a workflow on:
+
+- **Watch a session you are not driving** — another TUI, the web UI, a script. `raw`
+  shows its events live, which `watch` cannot do because it filters to the current
+  session.
+- **Prove the connection** — `raw -i` shows the HTTP response headers: `200` plus an
+  event stream, versus `401` with no body.
+- **Learn the event shapes** — what `session.text.delta`, `session.step.failed` and
+  the rest actually look like, before writing a filter or a parser.
+- **Diagnose a stuck agent** — silence from `ask` has several causes. `raw` shows
+  whether events are arriving at all, which separates "blocked on a question" from
+  "slow model" from "not connected".
+- **Check liveness** — `: heartbeat` comments prove the stream is still open.
+- **Capture for later** — pipe to a file and inspect the frames after the fact.
+- **See everything at once** — every session, every project, including other people's
+  prompts and replies. See the warning below.
+
+For one session, use `watch`. For one prompt, use `ask --raw`.
+
+#### Warning
+
+No redaction and no filter. On a busy or shared server, other users' prompts and
+model replies pass by in clear text. Do not leave it running in a shared terminal.
+
 ---
 
 ### `selftest`
@@ -706,6 +864,43 @@ Starts its own opencode instance, exercises info, session creation, model listin
 model switch and a prompt round-trip, then tears it down. Never touches your real
 server or your session library. Useful after changing the tool, or for checking that
 a machine can run it at all.
+
+No server, no configuration, no account is needed. From a fresh clone:
+
+```bash
+git clone https://github.com/hiramag/opencode-tools.git
+cd opencode-tools
+
+brew install jq              # the only hard dependency
+./opencode-bash-tool.sh selftest
+
+./tests/run.sh               # the unit suites; also needs no server
+```
+
+A sample run:
+
+```
+% ./opencode-bash-tool.sh selftest
+test server ready on http://127.0.0.1:4997
+  host:       http://127.0.0.1:4997   (throwaway, not your server)
+  workspace:  /var/folders/.../T/tmp.cTZMalxuBX   (temporary, removed on exit)
+  probe:      selftest-probe-44429-1794214255
+
+  info                      ok
+  new                       ok
+  models                    ok
+  model switch              ok
+  prompt round-trip         ok
+  unquoted prompt           ok
+
+  session used: ses_e407f21a8ffeOPUuxxx6QtcRGu
+  host:        http://127.0.0.1:4997
+
+all checks passed
+```
+
+It reports a non-zero exit if any check fails, so it drops into CI or a pre-commit
+hook unchanged.
 
 ---
 
@@ -824,28 +1019,43 @@ about the session, not the connection. Check with:
 
 ## Index
 
-### Commands
+### One-shot — no session
+
+These call the server and keep nothing: no session, no history, no event stream.
 
 | Command | Purpose |
 |---|---|
+| `ask` | Send a prompt. `--model`/`--provider` choose the model |
+| `raw-ask` | Same call, printing the server's raw JSON body |
 | `ping` | Reachability and auth, unambiguously |
 | `info` | Raw server info JSON |
-| `new` | Create and register a session |
+| `models` | List available models |
+| `dirs` | Browse the server's filesystem |
+| `raw` | Unfiltered event stream — every session, no filter |
+| `delete --session-id` | Delete a session by id, no local record needed |
+| `selftest` | End-to-end checks, local throwaway server |
+| `--version`, `-V`, `version` | Version, path and line count of this copy |
+
+### Bound to the current session
+
+These read the active session from `~/.opencode/sessions` and act on it.
+
+| Command | Purpose |
+|---|---|
+| `new` | Create and register a session, and make it current |
 | `ls` | List registered sessions |
 | `use` | Switch the current session |
-| `ask` | Send a prompt |
+| `ask --live`/`--wait`/`--raw` | Run inside the session, with its tools and history |
 | `wait` | Block until the session is idle |
 | `watch` | Stream events for the current session |
 | `history` | Last three messages, raw JSON |
 | `model` | Change the session's model |
-| `models` | List available models |
-| `dirs` | Browse the server's filesystem |
 | `locations` | Active session, loaded locations, project registry |
 | `rm` | Forget a session locally |
 | `delete` | Delete a session on the server |
-| `raw` | Unfiltered event stream |
-| `selftest` | End-to-end checks, local throwaway server |
-| `--version`, `-V`, `version` | Version, path and line count of this copy |
+
+`ask` is the only command that switches category: one-shot by default, session-bound
+with `--live`, `--wait` or `--raw`. `raw-ask` is always one-shot.
 
 ### Flags
 
@@ -853,8 +1063,8 @@ about the session, not the connection. Check with:
 |---|---|---|
 | `--as <name>` | `new` | Register the session under a name |
 | `--dir <path>` | `new` | Directory, flag form |
-| `--model <id>` | `new` | Model, flag form |
-| `--provider <id>` | `new` | Provider, flag form |
+| `--model <id>` | `new`, `ask`, `raw-ask` | Model, flag form |
+| `--provider <id>` | `new`, `ask`, `raw-ask` | Provider, flag form |
 | `--refresh` | `ls` | Exact counts from the server |
 | `--live` | `ask` | Stream the reply (default) |
 | `--wait` | `ask` | Print once complete |
@@ -869,4 +1079,5 @@ about the session, not the connection. Check with:
 | `OPENCODE_HOST` | yes | Server URL, **including scheme and port** |
 | `OPENCODE_PASS` | yes | Server account password |
 | `ASK_MODE` | no | Default `ask` output mode |
+| `ASK_SILENCE` | no | Seconds of event silence before `ask` gives up (default `60`) |
 | `PROJECT_DIR` | no | **Ignored.** Reported once, then discarded |

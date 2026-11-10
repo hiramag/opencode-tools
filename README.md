@@ -1,18 +1,26 @@
 # opencode-bash-tool.sh
 
-A script for driving an OpenCode server over HTTP and SSE.
+Exploring opencode internal via a bash script.  Tool for testing and driving an OpenCode server's event stream over SSE.
 
-**Point it at a local opencode instance, or at a server running opencode.** You do
-not have to deploy one yourself.
+**Point it at a local opencode instance, or at a server running opencode.** 
 
 ```bash
+# Pre-req is that you have opencode installed locally or on a remote server
+# One way to start it in the background is by typing:
+opencode serve &
+
+# once it's up, you'll get something like this:
+# server listening on http://127.0.0.1:4096
+# server password <generated password>
+
 # a local instance, on this machine
 export OPENCODE_HOST='http://127.0.0.1:4096'
 
 # or a server running opencode, anywhere
 export OPENCODE_HOST='http://<server-host>:4096'
 
-export OPENCODE_PASS='anything'     # sent as Basic auth; ignored if the server has none
+export OPENCODE_PASS='<generated password>'     # sent as Basic auth
+
 ```
 
 [server.md](./server.md) is one way to stand up a server on a Proxmox LXC. It is a
@@ -22,26 +30,40 @@ or your LAN.
 See [Pointing somewhere else](#pointing-somewhere-else) if you use more than one
 target.
 
-| File | |
-|---|---|
+| File                    |                                                       |
+| ----------------------- | ----------------------------------------------------- |
 | `opencode-bash-tool.sh` | Drive and inspect the server's event stream over HTTP |
-| `README.md` | This file — client reference |
-| `server.md` | Server deployment, verification and traps |
-| `tests/` | Unit tests for the fiddly logic — `./tests/run.sh` |
+| `README.md`             | This file — client reference                          |
+| `server.md`             | Server deployment, verification and traps             |
+| `tests/`                | Unit tests for the fiddly logic — `./tests/run.sh`    |
+
+## Contents
+
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Is it connected?](#is-it-connected)
+- [Commands](#commands)
+- [Sessions](#sessions)
+- [Configuration](#configuration)
+- [Security](#security)
+- [Events and streaming](#events-and-streaming)
+- [API notes](#api-notes)
+- [Troubleshooting](#troubleshooting)
+- [selftest](#selftest)
+
+---
 
 ## Requirements
 
-| | |
-|---|---|
-| `bash` | 3.2 or newer. macOS ships 3.2, which is enough |
-| `curl` | All HTTP. Preinstalled on macOS and most Linux |
-| **`jq`** | **Required.** Parses SSE event payloads and builds request bodies |
-| `base64` | Builds the Basic auth header. Preinstalled on macOS and most Linux |
-| `opencode` | Only if you run your own server, and for `selftest`, which starts a local one. Not needed when you point at an instance that already exists |
-`jq` is a hard dependency, not optional. The script parses model output from the
-event stream — arbitrary text containing quotes, escapes and newlines — and
-constructs JSON request bodies from your prompt. `sed` and `grep` cannot do that
-safely, and a partial failure would corrupt replies intermittently.
+
+|            |                                                                                                                                                                                                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bash`     | 3.2 or newer.                                                                                                                                                                                                                                                                         |
+| `curl`     | Preinstalled on macOS and most Linux                                                                                                                                                                                                                                                  |
+| **`jq`**   | **Required.** Parses SSE event payloads and builds request bodies. <br>`jq` is a hard dependency, not optional. The script parses model output from the event stream,<br>arbitrary text containing quotes, escapes and newlines — and constructs JSON request bodies from your prompt |
+| `base64`   | Builds the Basic auth header. Preinstalled on macOS and most Linux                                                                                                                                                                                                                    |
+| `opencode` | local or remote opencode instance                                                                                                                                                                                                                                                     |
+
 
 The script checks for missing dependencies at startup and names the one it
 cannot find, so you will not get a confusing error mid-run.
@@ -53,38 +75,20 @@ apt install jq           # Debian/Ubuntu, including the server
 
 ---
 
-## Security
+## Quick start
 
-Read this before exposing anything to a network you do not fully control.
+Now point it at a server. Set the two required variables — see
+[Configuration](#configuration) — and confirm the connection before anything else.
 
-**The transport is plain HTTP.** `OPENCODE_HOST` is whatever URL you give it, and
-the examples here are `http://`. Authentication is HTTP Basic — a base64 string,
-which is encoding, not encryption. Anyone able to observe the traffic can recover
-the password from it. This is acceptable on a trusted LAN and nothing else.
+```bash
+./opencode-bash-tool.sh ping                                 # reachable + authenticated
+./opencode-bash-tool.sh models <filter>                      # what can this server run?
+./opencode-bash-tool.sh new <path>                           # session on the server's default model
+./opencode-bash-tool.sh ask "explain this repo"              # reply appears here
+```
 
-**If you deploy the server**, its containment is one-directional and partial.
-`server.md` documents this in full; the short version:
-
-| | |
-|---|---|
-| Writes | Confined to the server's working directory by systemd |
-| Reads | **Not confined.** Any file the service account can read, it can read |
-| Outbound network | **Unrestricted.** The agent can reach the public internet |
-
-Deploying it to an untrusted network without putting HTTPS in front is not a good
-idea.
-
-**This client is unprivileged.** It needs no root, writes only to
-`~/.opencode/sessions/`, and makes no changes to the target beyond creating,
-modelling and deleting sessions you explicitly ask for. It sends your prompt text
-and receives model output; that traffic goes wherever `OPENCODE_HOST` points.
-
-**`selftest` is the exception worth knowing about**: it binds a throwaway server to
-`127.0.0.1` on a random port and removes it afterwards. Nothing else on the
-machine is touched.
-
-If you need this over anything but a trusted network, terminate TLS in front of the
-server and point `OPENCODE_HOST` at `https://`.
+Run `watch` in a second terminal when you want the raw event stream rather than
+just the reply.
 
 ---
 
@@ -105,111 +109,19 @@ One command, and it names the failure rather than printing nothing:
   session    ses_ec6e50...
 ```
 
-| Output | Meaning |
-|---|---|
-| `status 200` | connected and authenticated |
-| `status 401` | reachable, **password is wrong** — usually a rotation |
-| `status 000` | **not reachable** — wrong host, stopped service, or firewall |
-| `session none` | connected fine, just needs `new` |
+
+| Output         | Meaning                                                      |
+| -------------- | ------------------------------------------------------------ |
+| `status 200`   | connected and authenticated                                  |
+| `status 401`   | reachable, **password is wrong** — usually a rotation        |
+| `status 000`   | **not reachable** — wrong host, stopped service, or firewall |
+| `session none` | connected fine, just needs `new`                             |
+
 
 The session library lives in `~/.opencode/sessions`, not `/tmp`, so a reboot
 clears nothing. `session` shows `none` only before your first `new`.
 
 ---
-
-## Try it in thirty seconds
-
-No server, no configuration, no account. This starts a throwaway `opencode` on
-localhost, runs the whole path against it, and tears it down:
-
-```bash
-git clone https://github.com/hiramag/opencode-tools.git
-cd opencode-tools
-
-brew install jq              # the only hard dependency
-./opencode-bash-tool.sh selftest
-
-./tests/run.sh               # the unit suites; also needs no server
-```
-
-`selftest` prints which checks passed and reports a non-zero exit if any fail. If
-that works, the tool is fine and the only thing left is choosing a server.
-
-## Quick start
-
-Now point it at a server. Set the two required variables — see
-[Configuration](#configuration) — and confirm the connection before anything else.
-
-```bash
-./opencode-bash-tool.sh ping                                 # reachable + authenticated
-./opencode-bash-tool.sh models <filter>                      # what can this server run?
-./opencode-bash-tool.sh new <path>                           # session on the server's default model
-./opencode-bash-tool.sh ask "explain this repo"              # reply appears here
-```
-
-Run `watch` in a second terminal when you want the raw event stream rather than
-just the reply.
-
-## The raw SSE stream
-
-`raw` shows exactly what the server puts on the socket, with no filtering and no
-JSON parsing:
-
-```bash
-./opencode-bash-tool.sh raw          # the stream
-./opencode-bash-tool.sh raw -i       # plus response headers
-```
-
-Three kinds of line appear:
-
-```
-data: {"id":"evt_...","type":"session.text.delta",...,"delta":" with me:\n\n- If..."}
-
-: heartbeat
-
-data: {"id":"evt_...","type":"session.execution.succeeded",...}
-```
-
-| | |
-|---|---|
-| `data: <json>` | One event. The JSON occupies a single line |
-| *(blank)* | Event boundary |
-| `: heartbeat` | A comment. Held on the wire to keep the connection alive, never dispatched |
-
-Note that `\n` inside `delta` is **two literal characters**, not a newline. JSON
-escapes are never resolved on the wire, which is the concrete reason the script
-needs `jq` rather than `sed` — see [Requirements](#requirements).
-
-`raw` uses `exec`, so curl owns the terminal. Streaming is unbuffered and Ctrl-C
-exits cleanly. No saved session is required, so it works before you have run
-`new`.
-
-### Heads up
-
-`raw` applies **no filter of any kind**. Every event from every session and every
-workspace goes to your terminal. On a busy server that is a lot of output, and
-prompts and model replies from other users pass by unredacted.
-
-It is a diagnostic tool — useful for confirming heartbeats, watching `seq`
-increment, or checking what an event actually looks like. Do not leave it running
-in a shared terminal. Use `watch` when you want a filtered view of one session.
-
-## Raw frames from a prompt
-
-`ask --raw` does the same thing but scoped to one prompt, so you do not need a
-second terminal:
-
-```bash
-./opencode-bash-tool.sh ask --raw "what does this repo do?"
-```
-
-It prints the `data:` lines exactly as they arrive, with no JSON decoding — so
-`\n` stays as a literal backslash-n and you see the event types as the model
-writes. Heartbeat comments and blank separators are skipped to keep it readable;
-the `raw` command shows those.
-
-The default is unchanged. `--live` still streams the rendered reply, `--wait`
-still prints it once complete, and no flag behaves as before.
 
 ## Commands
 
@@ -220,84 +132,103 @@ the same list.
 > variant in table form, with worked examples, a section on commands that take more
 > than one argument, and a table decoding every failure message.
 
-The summary table follows.
+Two kinds of command. **One-shot** commands call the server and keep nothing:
+no session, no history, no event stream. **Session-bound** commands read the
+active session from `~/.opencode/sessions` — the one `new` or `use` selected —
+and act on it.
+
+---
+
+### One-shot — no session
 
 | Command | |
 |---|---|
+| `ask "<text>"` | One reply. `--model` and `--provider` choose the model; no session is created |
+| `raw-ask "<text>"` | Same call, but prints the server's raw JSON body instead of extracting `.data.text` |
 | `info` | Server version, pid, capabilities. First thing to run |
-| `ping` | Check reachability and auth, naming which failed. Needs no session |
-| `new [dir] [model] [provider]` | Create a session, set its model, and register it in `~/.opencode/sessions/`. Validates the directory first; browses for one if it is missing or wrong |
-| `new ... --as <name>` | As above, and register the session under a name for later `use` |
-| `ls` | List named sessions with id, directory, model and creation time |
-| `locations` | Show the active session's directory, the server's cached locations, and known projects |
+| `ping` | Check reachability and auth, naming which failed |
+| `models [filter]` | Available model ids |
 | `dirs [path]` | Browse the server's filesystem. Defaults to the server's own working directory |
+| `raw` | Unfiltered event stream. Not one-shot in the model sense — it streams every session's events, with no filter of any kind |
+| `delete --session-id <id>` | Delete a session by id. Needs no local record |
+| `selftest` | End-to-end checks against a throwaway server on localhost |
+| `--version` | Version, path and line count of this copy |
+
+---
+
+### Bound to the current session
+
+| Command | |
+|---|---|
+| `new [dir] [model] [provider]` | Create a session, set its model, register it in `~/.opencode/sessions/`, and make it current |
+| `new ... --as <name>` | As above, under a name for later `use` |
+| `ls` | List named sessions with id, directory, model and creation time |
 | `use <name>` | Make a named session the active one |
 | `rm <name>` | Forget a named session. Does not delete it on the server |
 | `delete <name>` | Delete a named session **on the server too**, and every message in it. Prompts for confirmation; `-y` skips it |
-| `delete --session-id <id>` | Same, for a session that has no name |
+| `model <id> [provider]` | Switch this session's model. Session-scoped: new sessions revert to the server default |
+| `history` | Last three messages, raw JSON |
+| `wait` | Block until the session is idle |
+| `watch` | Stream events, filtered to this session |
+| `ask --live\|--wait\|--raw` | Run inside this session, with its tools, files and earlier turns. `--model` switches the session's model first |
+| `locations` | Show this session's directory, plus the server's cached locations and project registry |
 
-### Choosing a directory
+---
 
-`new` will not create a session against a directory that does not exist on the
-server. The server happily returns a session id for any path, so a typo used to
-leave a permanent entry in the project registry — that is where `/blah` came
-from.
+### One command, two modes
 
-```
-$ ./opencode-bash-tool.sh new /blah
-directory not found on the server: /blah
-No valid directory given. Browse the server filesystem.
-```
+`ask` is one-shot by default and becomes session-bound only with `--live`,
+`--wait` or `--raw`. `raw-ask` is always one-shot and rejects those flags — it
+has no session to attach to.
 
-Resolution order:
+`--model` works in both, but it means something different each time:
 
-1. A directory given as an argument, if it exists
-2. otherwise the server's own working directory
-3. Otherwise an interactive browser — number to descend, `.` to accept the
-   current path, `q` to quit
+- **One-shot** — the model for that call. Nothing is stored.
+- **Session mode** — the session's model is switched first and the change
+  persists. The script prints a note when it does that, so the side effect is
+  visible rather than silent.
 
-Nothing is written to the server until a real directory is chosen, so a
-mistyped path costs nothing.
+In session mode the model cannot be per-request: the server keeps it on the
+session, not on the message.
 
-Only `OPENCODE_HOST` and `OPENCODE_PASS` are required, and nothing else can be configured to point
-elsewhere — sessions may only be created under the server's working directory.
+---
 
-### Rotating the password
+### What each command actually needs
 
-The server reads `OPENCODE_PASSWORD` from its environment file, which systemd
-loads before dropping privileges. Rotating it is a one-line edit plus a restart.
+Requiring network credentials for a command that never touches the network is
+just friction. The check is scoped to what each command uses:
 
-On the server:
 
-```bash
-openssl rand -hex 24
+| Commands                                                         | Requires                                          |
+| ---------------------------------------------------------------- | ------------------------------------------------- |
+| `ls`, `rm`                                                       | **nothing** — purely local files                  |
+| `ping`, `use`, `ask`, `raw-ask`, `history`, `model`, `wait`, `watch`, `raw` | `OPENCODE_HOST`, `OPENCODE_PASS`                  |
+| `new`, `delete`, `info`, `models`, `dirs`, `locations`           | `OPENCODE_HOST`, `OPENCODE_PASS`                  |
+| `selftest`                                                       | nothing — supplies its own, on a throwaway server |
 
-sudo sed -i 's|^OPENCODE_PASSWORD=.*|OPENCODE_PASSWORD=<new-value>|' \
-  /etc/opencode/server.env
-sudo systemctl restart opencode
-```
 
-Then update `OPENCODE_PASS` wherever the client is configured.
-
-Two things to know:
-
-**Changing it revokes every paired session.** The web UI and desktop/mobile app
-sessions last 30 days and are signed out when the server password changes. Anyone
-using `opencode pair` will need to re-pair.
-
-**If it goes wrong, the server still starts.** With the variable set but wrong,
-the service comes up fine and simply authenticates nobody. Confirm in the log
-that you see `server listening` and **no** `server password` line — a password
-line means the env file was not read and the server generated a random one:
+So this works from a bare shell:
 
 ```bash
-journalctl -u opencode -n 15 --no-pager | grep -E 'listening|server password'
+./opencode-bash-tool.sh ls
 ```
 
-The password travels in cleartext HTTP across the LAN, so rotate it if it has
-been typed into shared terminals, committed, or pasted anywhere.
+The store defaults to `~/.opencode/sessions`. To point it elsewhere:
 
-### Sessions
+```bash
+SESSIONS_DIR=~/somewhere/else ./opencode-bash-tool.sh ls
+```
+
+`selftest` is exempt entirely — it exports its own credentials and asserts its
+own target before sending anything.
+
+---
+
+## Sessions
+
+---
+
+### What a session is
 
 There is **one store**, in `~/.opencode/sessions`, one JSON file per session:
 
@@ -320,6 +251,8 @@ and nothing lives in `/tmp` to be swept away by a reboot.
 `ask`, `history`, `model`, `wait` and `locations` act on current and never take
 a session ID. `rm <name>` forgets it locally; `delete <name>` removes it from the
 server too.
+
+---
 
 ### Every session gets a name
 
@@ -346,6 +279,8 @@ Nothing is created and nothing is attached. The two outcomes — continue old
 context, or start clean — are opposites, and the script cannot know which you
 meant. You only get `ha-2` by asking for it.
 
+---
+
 ### Sessions may only be created under the server's working directory
 
 The server's `WorkingDirectory` is a hard root. `new /etc` is refused, and the
@@ -363,6 +298,36 @@ for checking something exists.
 The check compares `$dir == $root || $dir == "$root/"*`, never `$dir == "$root"*`:
 the second form accepts `/projects2`, a different tree that merely shares a
 string prefix.
+
+---
+
+### Choosing a directory
+
+`new` will not create a session against a directory that does not exist on the
+server. The server happily returns a session id for any path, so a typo used to
+leave a permanent entry in the project registry — that is where `/blah` came
+from.
+
+```
+$ ./opencode-bash-tool.sh new /blah
+directory not found on the server: /blah
+No valid directory given. Browse the server filesystem.
+```
+
+Resolution order:
+
+1. A directory given as an argument, if it exists
+2. otherwise the server's own working directory
+3. Otherwise an interactive browser — number to descend, `.` to accept the
+current path, `q` to quit
+
+Nothing is written to the server until a real directory is chosen, so a
+mistyped path costs nothing.
+
+Only `OPENCODE_HOST` and `OPENCODE_PASS` are required, and nothing else can be configured to point
+elsewhere — sessions may only be created under the server's working directory.
+
+---
 
 ### `ls`
 
@@ -399,37 +364,8 @@ to the previously-current session.
 
 `host` is recorded per entry, so pointing the client at a second server warns
 rather than silently acting on the wrong one.
-## selftest
 
-```bash
-./opencode-bash-tool.sh selftest
-```
-
-Starts a temporary `opencode serve` on `127.0.0.1:4997` with a throwaway password,
-exercises the commands against it, then tears it down. Never touches your
-configured `OPENCODE_HOST`/`OPENCODE_PASS` or the server.
-
-```
-  info                      ok
-  new                       ok
-  models                    ok
-  model switch              ok
-  prompt round-trip         ok
-
-all checks passed
-```
-
-`prompt round-trip` is the one that matters. It sends a unique probe string and
-asserts via `history` that the server received it *verbatim* — the regression that
-shipped once, when the script sent the literal string `ask` instead of your prompt.
-
-Verify the test still bites by deleting the `shift` line in the `ask)` branch; it
-should report `prompt round-trip FAIL`. Exit code is 0 on success and 1 on
-failure, so it drops into CI or a pre-commit hook unchanged.
-
-`selftest` supplies its own `OPENCODE_HOST`, `OPENCODE_PASS` and `SESSIONS_DIR`, and
-asserts before sending anything that it really is pointed at the throwaway server.
-It aborts rather than risk touching a real one.
+---
 
 ## Configuration
 
@@ -447,11 +383,13 @@ default to are both taken from the server, not configured here.
 **`OPENCODE_HOST` must include both the scheme and the port.** Without them curl defaults to
 port 80 and the request hangs rather than failing, which is slow to diagnose:
 
-| Value | |
-|---|---|
-| `http://<server-host>:4096` | correct |
-| `<server-host>:4096` | no scheme — treated as a hostname |
-| `<server-host>` | no scheme, no port — tries port 80 and hangs |
+
+| Value                       |                                              |
+| --------------------------- | -------------------------------------------- |
+| `http://<server-host>:4096` | correct                                      |
+| `<server-host>:4096`        | no scheme — treated as a hostname            |
+| `<server-host>`             | no scheme, no port — tries port 80 and hangs |
+
 
 Or prefix a single invocation:
 
@@ -475,91 +413,23 @@ source ~/opencode-server.env
 The session library lives at `~/.opencode/sessions`, outside `/tmp`, so it
 survives reboots. Override it with `SESSIONS_DIR` if you want it elsewhere.
 
-### What each command actually needs
-
-Requiring network credentials for a command that never touches the network is
-just friction. The check is scoped to what each command uses:
-
-| Commands | Requires |
-|---|---|
-| `ls`, `rm` | **nothing** — purely local files |
-| `ping`, `use`, `ask`, `history`, `model`, `wait`, `watch`, `raw` | `OPENCODE_HOST`, `OPENCODE_PASS` |
-| `new`, `delete`, `info`, `models`, `dirs`, `locations` | `OPENCODE_HOST`, `OPENCODE_PASS` |
-| `selftest` | nothing — supplies its own, on a throwaway server |
-
-So this works from a bare shell:
-
-```bash
-./opencode-bash-tool.sh ls
-```
-
-The store defaults to `~/.opencode/sessions`. To point it elsewhere:
-
-```bash
-SESSIONS_DIR=~/somewhere/else ./opencode-bash-tool.sh ls
-```
-
-`selftest` is exempt entirely — it exports its own credentials and asserts its
-own target before sending anything.
-
-### Why no fallbacks
-
-A `${VAR:-default}` fallback can silently point a command at the wrong server. If
-an export failed, a test would quietly run against the real server and report success.
-`selftest` now asserts its own target and aborts if it is not pointed at the
-throwaway server.
-
-Requirements are listed under [Requirements](#requirements) above.
-
-**`watch` filters on the session ID, so `: heartbeat` comment lines are invisible
-by design.** To see the raw stream including heartbeats:
-
-```bash
-curl -sN -H "Authorization: Basic $AUTH" "$OPENCODE_HOST/api/event"
-```
-
 ---
 
-## Pointing somewhere else
+### Pointing somewhere else
 
 `OPENCODE_HOST` is the only thing that decides which server you talk to. Change it
 and everything else follows — nothing in the script is tied to a LAN, a Proxmox
 host, or a particular subnet.
 
-| Target | Value |
-|---|---|
-| This machine | `export OPENCODE_HOST='http://127.0.0.1:4096'` |
-| A laptop on the same network | `export OPENCODE_HOST='http://<laptop-host>:4096'` |
-| A shared or remote instance | `export OPENCODE_HOST='https://<host>'` |
-| A throwaway, for checking the tool works | `./opencode-bash-tool.sh selftest` |
 
-### Containment follows the server
+| Target                                   | Value                                              |
+| ---------------------------------------- | -------------------------------------------------- |
+| This machine                             | `export OPENCODE_HOST='http://127.0.0.1:4096'`     |
+| A laptop on the same network             | `export OPENCODE_HOST='http://<laptop-host>:4096'` |
+| A shared or remote instance              | `export OPENCODE_HOST='https://<host>'`            |
+| A throwaway, for checking the tool works | `./opencode-bash-tool.sh selftest`                 |
 
-Sessions may only be created **under the target's own working directory**, and the
-tool reads that from the server rather than assuming it. Point at a local opencode
-and the boundary becomes whatever that process's working directory is — it is not
-`/projects` unless that server was set up that way.
-
-If the working directory cannot be read, the tool refuses to create anything rather
-than guessing.
-
-### One library, several servers
-
-`~/.opencode/sessions/` is a single shared store. Records do record which host they
-belong to, and `use` tells you when you switch to a session recorded against a
-different host — but `ls` has no host column, so a listing can mix servers.
-
-Worse, name collisions are checked **on the name alone**. A session called `work` on
-one server blocks `work` on another, and the refusal will not say which server owns
-it.
-
-The fix is a separate library per target:
-
-```bash
-export SESSIONS_DIR=~/.opencode/sessions-local
-```
-
-Or use distinct names. Nothing else needs to change.
+---
 
 ### Authentication
 
@@ -567,6 +437,8 @@ Or use distinct names. Nothing else needs to change.
 fallbacks by design. If the target server needs no password it ignores the header, so
 any value works — but leaving the variable unset is a hard error, not a silent
 anonymous request.
+
+---
 
 ### Proving it without setting anything up
 
@@ -579,59 +451,41 @@ whole path — connection, session creation, model listing, model switch, prompt
 round-trip. Nothing else on the machine is touched, and the server is torn down
 afterwards. If that passes, pointing at a local or laptop instance will too.
 
+Model ids are written two different ways depending on where they go — bare in
+commands, `provider/model` in `opencode.json`. Getting it wrong is silent, so it has
+its own note in
+[COMMANDS.md](./COMMANDS.md#bare-id-vs-providermodel).
+
 ---
 
-# API notes
+## Security
 
-All verified against opencode v2.0.27 against a live server.
+Read this before exposing anything to a network you do not fully control.
 
-## Authentication
+**Warning, the transport is plain HTTP.** `OPENCODE_HOST` is whatever URL you give it, and
+the examples here are `http://`.  Authentication is HTTP Basic — a base64 string,  
+which is encoding, not encryption. Anyone able to observe the traffic can recover the password from it. 
 
-HTTP **Basic**, username literally `opencode`. Bearer tokens do not work.
+Deploying it to an untrusted network without putting HTTPS in front is not a good
+idea.
 
-```bash
-AUTH=$(printf 'opencode:%s' "$OPENCODE_PASS" | base64 | tr -d '\n')
-curl -H "Authorization: Basic $AUTH" "$OPENCODE_HOST/api/info"
-```
+---
 
-The server password comes from `OPENCODE_PASSWORD`, falling back to
-`OPENCODE_SERVER_PASSWORD`. `opencode serve` has **no** `--password` flag; the
-documented `opencode service set password` applies to the managed background
-service, not to foreground `serve`.
+### Containment follows the server
 
-If neither env var is set, the server generates a random 32-character password
-per boot and prints it to the journal. If you set the var, the password is
-**not** printed — so there is no fallback copy if you lose it.
+Sessions can only be created **under the server's own working directory**. The tool
+reads that from the server instead of assuming a path, so the boundary moves with
+whatever you point at.
 
-## Response shapes
+If it cannot read the working directory, it creates nothing.
 
-**Success responses are wrapped in `data`:**
+---
 
-```json
-{ "data": { "id": "ses_...", ... } }
-```
+## Events and streaming
 
-**Error responses are NOT wrapped:**
+---
 
-```json
-{ "_tag": "SessionNotFoundError", "sessionID": "ses_bogus", "message": "Session not found" }
-```
-
-A uniform `.data` access breaks on the failure path. Check the status code first.
-
-## Status codes
-
-`POST /api/session/{id}/model` returns **`204 No Content`** on success, not 200.
-Other documented responses: `400` invalid request, `401` unauthorized, `404`
-session or location not found.
-
-## Message arrays are newest-first
-
-`GET /api/session/{id}/message` returns `[0]` as the *most recent* message. To
-show recent messages use `.data[:3]`, not `.data[-3:]` — the latter returns the
-oldest three.
-
-## Events
+### Events
 
 Events arrive as SSE `data:` frames carrying a JSON envelope:
 
@@ -658,82 +512,196 @@ before assuming.
 **`session.text.ended` carries the complete text.** Accumulate `delta` events
 only for live rendering; for a finished message take it from the `ended` event.
 
-## Stream behaviour
+---
 
-Live-only. No replay, no automatic reconnection, no resume via `Last-Event-ID`.
-A late subscriber receives a `server.connected` marker, not missed events.
+### Stream behaviour
 
-Idle connections are kept alive by periodic `: heartbeat` SSE comments.
+The stream is live. You see what happens while you are connected, and nothing else.
 
-Sessions persist server-side in `~/.local/share/opencode/opencode.db`, so a
-dropped stream costs you nothing but real-time updates. The session ID is the
-durable handle — persist it and you can always re-sync.
+- **Nothing is replayed.** Connect late and you miss the earlier events.
+- **There is no automatic reconnect.** If the connection drops, reconnect yourself.
+- **You cannot resume** from the last event you saw.
+- **Connecting does not fill you in.** The server sends one `server.connected`
+  marker so you know the stream is open, but it is not a summary of what you missed.
+
+While nothing is happening, the server sends a `: heartbeat` comment now and then to
+stop the connection timing out. You can ignore it.
+
+Losing the stream does not lose work. Sessions live on the server in
+`~/.local/share/opencode/opencode.db`, so reconnecting picks up where the session
+left off. Keep the session ID — that is what you reconnect to.
+
+If you are writing a client, that means you need your own retry loop with a
+backoff, and your own storage if you need history. Do not treat this stream as a
+record of what happened.
 
 ---
 
-# Gotchas hit while building this
+### The raw SSE stream
 
-Worth keeping, because each one failed silently or misleadingly.
+`raw` shows exactly what the server puts on the socket, with no filtering and no
+JSON parsing:
 
-1. **The directory must exist on the server.** The server attaches a session to a
-   real directory; a placeholder path fails session creation.
+```bash
+./opencode-bash-tool.sh raw          # the stream
+./opencode-bash-tool.sh raw -i       # plus response headers
+```
 
-2. **Responses are wrapped in `data`.** The typed `@opencode/client` unwraps
-   envelopes for you, which is why its examples show bare objects. Raw `curl`
-   needs `.data.id`. Assuming a top-level `id` made a working server look broken.
+Three kinds of line appear:
 
-3. **`204` is a success status.** Rejecting anything but 200/201 turned a
-   successful model switch into a reported failure — and because 204 has no body,
-   the error message read `server said:` with nothing after it.
+```
+data: {"id":"evt_...","type":"session.text.delta",...,"delta":" with me:\n\n- If..."}
 
-4. **Message arrays are newest-first**, so `[-3:]` silently returns the oldest
-   messages. Looks correct only when there happen to be three of them.
+: heartbeat
 
-5. **Model IDs are not validated at switch time.** `model definitely-not-real`
-   returns success and fails later, when you `ask`. Use `models` as the
-   authoritative check.
+data: {"id":"evt_...","type":"session.execution.succeeded",...}
+```
 
-6. **Don't swallow responses in scripts.** The first version of `new` replaced
-   the server's error body with a generic guess, which made diagnosis impossible.
-   All POSTs now separate status from body and report what the server actually said.
 
-7. **A blocked agent emits no events.** When the agent asks a question or requests
-   permission it goes quiet while waiting. A script that only waits for a terminal
-   event hangs until its guard expires. `ask` now gives up after 12s of silence and
-   says so, rather than looking frozen.
+|                |                                                                            |
+| -------------- | -------------------------------------------------------------------------- |
+| `data: <json>` | One event. The JSON occupies a single line                                 |
+| *(blank)*      | Event boundary                                                             |
+| `: heartbeat`  | A comment. Held on the wire to keep the connection alive, never dispatched |
 
-8. **`new` inherits the server's default model**, which may be one your account
-   can't afford. A fresh session then fails instantly with a 402 and produces no
-   text at all — indistinguishable from a broken client. Always pass the model:
 
-   ```bash
-   ./opencode-bash-tool.sh new <path> <model-id>
-   ```
+Note that `\n` inside `delta` is **two literal characters**, not a newline. JSON
+escapes are never resolved on the wire, which is the concrete reason the script
+needs `jq` rather than `sed` — see [Requirements](#requirements).
 
-9. **When output is blank, run `history`.** It is ground truth: it shows the exact
-   prompt text that was sent, the model used, and any error. A blank `ask` has
-   several possible causes and terminal output alone doesn't distinguish them.
+`raw` uses `exec`, so curl owns the terminal. Streaming is unbuffered and Ctrl-C
+exits cleanly. No saved session is required, so it works before you have run
+`new`.
 
-10. **A default model is a silent trap.** A session created without an explicit
-    model inherits the server default, which may be unfunded or broken. The
-    failure looks like a client bug. Check the `model` field in `history`, or set
-    the default server-side.
+---
 
-11. **Blank output is a symptom, not a cause.** Rejected prompt, failed model,
-    stopped service and unparseable stream all produce identical silence. Resist
-    theorising past an available measurement — `history` first, always.
+### When to use it
 
-12. **A test that cannot fail is not a test.** `selftest` checks the port is free
-    before starting and verifies `/api/info`'s `pid` matches the process it
-    spawned. Without those, a leaked server from a previous run answers the
-    readiness probe and every check passes against the wrong process. It also
-    confirms its own server actually died, by pid *and* by port — `kill` alone
-    does not prove the process is gone.
+It is the only command that shows what the server emits **before** any filtering,
+so it is a monitor and a diagnostic rather than something to build a workflow on:
 
-    Symptom seen in practice: an orphaned test server held port 4997 for eight
-    hours while each `selftest` run reported all checks passed.
+- **Watch a session you are not driving** — another TUI, the web UI, a script.
+  `watch` cannot do this; it filters to the current session.
+- **Prove the connection** — `raw -i` shows the response headers: `200` with a
+  stream, versus `401` with no body.
+- **Learn the event shapes** — what `session.text.delta`, `session.step.failed`
+  and the rest actually look like, before writing a filter or a parser.
+- **Diagnose a stuck agent** — silence from `ask` has several causes; `raw` shows
+  whether events are arriving at all, which separates "blocked on a question"
+  from "slow model" from "not connected".
+- **Check liveness** — `: heartbeat` comments prove the stream is still open.
+- **Capture for later** — pipe to a file and inspect the frames afterwards.
+- **See everything at once** — every session and every workspace.
 
-## Finding directories on the server
+---
+
+### Raw frames from a prompt
+
+`ask --raw` does the same thing but scoped to one prompt, so you do not need a
+second terminal:
+
+```bash
+./opencode-bash-tool.sh ask --raw "what does this repo do?"
+```
+
+It prints the `data:` lines exactly as they arrive, with no JSON decoding — so
+`\n` stays as a literal backslash-n and you see the event types as the model
+writes. Heartbeat comments and blank separators are skipped to keep it readable;
+the `raw` command shows those.
+
+The default is unchanged. `--live` still streams the rendered reply, `--wait`
+still prints it once complete, and no flag behaves as before.
+
+For a one-shot prompt with no session behind it, `raw-ask` prints the server's
+raw JSON body instead:
+
+```bash
+./opencode-bash-tool.sh raw-ask --model deepseek-v4.1-flash "what does this repo do?"
+```
+
+It uses the same stateless endpoint as `ask`, so there are no frames to show —
+only the response body, exactly as the server returned it.
+
+Both say "raw", and they do not show the same thing:
+
+| | `raw-ask "..."` | `ask --raw "..."` |
+|---|---|---|
+| Endpoint | `/api/experimental/generate/text` | `/api/session/{id}/prompt` plus `/api/event` |
+| Session | none | the saved session |
+| History | none kept | kept, and the session keeps growing |
+| Output | one JSON body | SSE `data:` frames |
+| Tools and files | no | yes — the session's agent |
+| `--model` | yes, for that call only | yes, and it changes the session's model |
+
+`raw-ask` asks one question and prints the JSON the server sends back. It keeps
+nothing, so it is the same call as `ask` without a session flag.
+
+`ask --raw` runs inside the saved session and prints the agent's event frames —
+no JSON decoding, no rendering, so `\n` stays two literal characters.
+
+**Rule of thumb:** `raw-ask` to see the response, `ask --raw` to see the stream.
+
+---
+
+## API notes
+
+---
+
+### API authentication
+
+HTTP **Basic**, username literally `opencode`. Bearer tokens do not work.
+
+```bash
+AUTH=$(printf 'opencode:%s' "$OPENCODE_PASS" | base64 | tr -d '\n')
+curl -H "Authorization: Basic $AUTH" "$OPENCODE_HOST/api/info"
+```
+
+The server password comes from `OPENCODE_PASSWORD`, falling back to
+`OPENCODE_SERVER_PASSWORD`. `opencode serve` has **no** `--password` flag; the
+documented `opencode service set password` applies to the managed background
+service, not to foreground `serve`.
+
+If neither env var is set, the server generates a random 32-character password
+per boot and prints it to the journal. If you set the var, the password is
+**not** printed — so there is no fallback copy if you lose it.
+
+---
+
+### Response shapes
+
+**Success responses are wrapped in `data`:**
+
+```json
+{ "data": { "id": "ses_...", ... } }
+```
+
+**Error responses are NOT wrapped:**
+
+```json
+{ "_tag": "SessionNotFoundError", "sessionID": "ses_bogus", "message": "Session not found" }
+```
+
+A uniform `.data` access breaks on the failure path. Check the status code first.
+
+---
+
+### Status codes
+
+`POST /api/session/{id}/model` returns **`204 No Content`** on success, not 200.
+Other documented responses: `400` invalid request, `401` unauthorized, `404`
+session or location not found.
+
+---
+
+### Message arrays are newest-first
+
+`GET /api/session/{id}/message` returns `[0]` as the *most recent* message. To
+show recent messages use `.data[:3]`, not `.data[-3:]` — the latter returns the
+oldest three.
+
+---
+
+### Finding directories on the server
 
 A session is bound to a directory, and that directory must exist on the server or
 `new` fails with `LocationNotFoundError`. Two commands tell you what is actually
@@ -776,22 +744,13 @@ if you pipe the output.
 This works on a freshly booted server — it does not depend on the server having
 warmed up any state.
 
-### Why not `/api/debug/location`
+---
 
-It looks like the obvious endpoint for "where does this server work", and it is
-what `locations` prints. But it is **usage-derived and lazily populated**: on a
-cold server it returns `[]`, and the first call warms the server so the second
-one succeeds. A client that chains off it gets an empty result on first contact
-and silently falls through to `/projects`'s parent — or to `/`.
+## Troubleshooting
 
-`/api/fs/list` with no path parameter resolves against the server's working
-directory, which exists from process start. One round trip, and the response
-names the location it picked.
+---
 
-Note that a directory used by an earlier session stays listed under *projects*
-even if it has since been deleted — the server keeps the record.
-
-## Diagnosing a blank `ask`
+### Diagnosing a blank `ask`
 
 Blank output was the single most expensive symptom on this setup — it looks
 identical whether the prompt was rejected, the model failed, or the server is
@@ -808,102 +767,36 @@ curl -sN -u opencode:OPENCODE_PASS OPENCODE_HOST/api/event    # are events flowi
 `provider.quota` 402 means billing, not code. Empty history means the prompt never
 became a message. Events flowing but no output means the client is at fault.
 
-## Known limitation
-
-`ask` can display the reply and detect that the agent is blocked, but it **cannot
-answer a question or grant permission**. Those need the form and permission reply
-endpoints (`POST /api/session/{id}/form/{formID}/reply` and
-`POST /api/session/{id}/permission/{requestID}/reply`), which take structured
-answers — beyond a shell script's scope.
-
-Until that exists, answer from the web UI, or steer the prompt toward a
-non-interactive outcome: *"don't ask me questions, make reasonable assumptions and
-proceed"*.
-
 ---
 
-## Other clients
-
-`opencode-bash-tool.sh` is not the only way in.
-
-**TUI**, from any machine on the LAN:
+## selftest
 
 ```bash
-export OPENCODE_PASSWORD='your-password'
-opencode --server http://<SERVER_IP>:4096
+./opencode-bash-tool.sh selftest
 ```
 
-**Web UI, desktop or mobile app** — open `http://<SERVER_IP>:4096` in a browser,
-then pair it from the server:
+Starts a temporary `opencode serve` on `127.0.0.1:4997` with a throwaway password,
+exercises the commands against it, then tears it down. Never touches your
+configured `OPENCODE_HOST`/`OPENCODE_PASS` or the server.
 
-```bash
-sudo -u opencode -H opencode pair
+```
+  info                      ok
+  new                       ok
+  models                    ok
+  model switch              ok
+  prompt round-trip         ok
+
+all checks passed
 ```
 
-That prints a one-time link with a 5-minute expiry and a QR code. Sessions last
-**30 days**, so treat scanning it as granting that machine the server's full
-capability — provider keys, write access to `/projects`, and the ability to shell
-out. Rotating the password revokes all of them at once.
+`prompt round-trip` is the one that matters. It sends a unique probe string and
+asserts via `history` that the server received it *verbatim* — the regression that
+shipped once, when the script sent the literal string `ask` instead of your prompt.
 
-No CORS configuration is needed unless you serve a *custom* web client from a
-different origin. CORS does not bypass server authentication either way.
+Verify the test still bites by deleting the `shift` line in the `ask)` branch; it
+should report `prompt round-trip FAIL`. Exit code is 0 on success and 1 on
+failure, so it drops into CI or a pre-commit hook unchanged.
 
-## The SSE constraint that matters for real code
-
-Subscriptions are **live-only**:
-
-- No replay of past events.
-- **No automatic reconnection.** A source failure ends current subscriptions;
-  you resubscribe after recovery.
-- A late subscriber gets the current `server.connected` marker, not missed events.
-- Idle connections are kept alive by periodic `: heartbeat` comments.
-
-Events carry a per-session `durable.seq`, but not every event is sequenced — a
-gap does not by itself prove data was lost. Filter by `data.sessionID`, not by
-`location`; some events carry no location at all.
-
-So a consumer needs an explicit backoff-and-resubscribe loop, and must persist
-events elsewhere if it needs history. Do not treat the stream as durable.
-
----
-
-# Cost
-
-`gemini-4-argon` (provider `opencode`) returns `402 Insufficient account funds`
-at zero balance. `space-bunny-free` returns `cost: 0` at the same balance — the
-balance gate is **per-model**, not per-account.
-
-```bash
-./opencode-bash-tool.sh model space-bunny-free
-```
-
-Session-scoped only; new sessions revert to the server default. To make it global,
-set `model` in the server's `opencode.json`.
-
-## Bare id vs `provider/model`
-
-The same string is correct in one place and wrong in the other. This has already
-caused a real bug, so it is worth stating plainly:
-
-| Where | Format | Example |
-|---|---|---|
-| API — `/api/model`, `POST /api/session/{id}/model`, this script's commands | bare `modelID` | `space-bunny-free` |
-| Config — `opencode.json` `"model"` | **`provider/model`** | `opencode/space-bunny-free` |
-
-`GET /api/model` returns `"id": "space-bunny-free"` with a separate
-`"providerID": "opencode"`, so a bare id looks right everywhere the API is
-concerned. Put that bare id in a config file and it is silently discarded at boot:
-
-```text
-WARN message="configuration normalization diagnostic"
-  path=$.model kind=invalid action="skipped malformed recognized value"
-```
-
-Logged at `WARN`, reported nowhere else, and the server then runs with no default
-model at all. Check after every config change:
-
-```bash
-grep 'normalization diagnostic' ~/.local/share/opencode/log/opencode.log | tail -3
-```
-
-Silent means clean. See [server.md](./server.md) for the server-side fix.
+`selftest` supplies its own `OPENCODE_HOST`, `OPENCODE_PASS` and `SESSIONS_DIR`, and
+asserts before sending anything that it really is pointed at the throwaway server.
+It aborts rather than risk touching a real one.

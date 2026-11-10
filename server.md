@@ -866,8 +866,7 @@ that same capability, delivered as a QR code. Do not treat scanning one as casua
 
 - **Password rotation.** The original password was a placeholder, travelled in
   cleartext HTTP across the LAN, and appears in transcripts. Rotating revokes all
-  paired sessions (30-day lifetime). Procedure is in
-  [README.md](./README.md#rotating-the-password).
+  paired sessions (30-day lifetime).
 - **Read containment.** Untested as an option:
   `TemporaryFileSystem=/` with `BindReadOnlyPaths` for each readable directory
   gives chroot-style read isolation. Needs a verification loop before it is

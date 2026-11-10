@@ -27,9 +27,12 @@
 #   delete --session-id <id>              same, for an unnamed session
 #   watch                               stream events for the saved session
 #   raw [-i]                            unfiltered SSE stream, no session needed
-#   ask [--live|--wait|--raw] "text"
-#                                          send a prompt, show the reply here
-#                                          --live    stream the reply (default)
+#   ask "text"                          one-shot model answer, no session
+#   ask --model <id> "text"             one-shot, with a specific model
+#   raw-ask "text"                     one-shot, print the server's raw JSON body
+#   raw-ask --model <id> "text"        same, choosing the model
+#   ask --live|--wait|--raw "text"      run in the saved session instead
+#                                          --live    stream the reply
 #                                          --wait    print the reply once complete
 #                                          --raw     print raw SSE frames
 #   model <id> [provider]               switch the saved session's model
@@ -39,9 +42,18 @@
 #   selftest                            end-to-end checks, local throwaway server
 #
 # ask options:
-#   --live    stream the reply as it writes (default)
-#   --wait    print the reply once complete
-#   --raw     print raw SSE frames instead of the rendered reply
+#   --model <id>      model to use (default: the server's)
+#   --provider <id>   provider for --model (default: opencode)
+#   --live    session mode: stream the reply as it writes
+#   --wait    session mode: print the reply once complete
+#   --raw     session mode: print raw SSE frames instead of the rendered reply
+#
+# In the one-shot form --model picks the model for that call. In a session mode
+# it switches the saved session's model first, which persists for later turns —
+# the script prints a note when it does that.
+#
+# One-shot asks create no session and keep no history. Use the session modes
+# (or `ask --wait`) when the agent needs tools, files, or earlier turns.
 #
 # Configuration is required: export OPENCODE_HOST and OPENCODE_PASS, or
 # set them at the top of this script. There are no fallbacks — a missing value is
@@ -59,7 +71,13 @@
 set -euo pipefail
 
 # Bump when behaviour changes under a command name that already existed.
-SCRIPT_VERSION="2026.10.15-21"
+SCRIPT_VERSION="2026.11.09-2"
+#   -2  ask: --model now works in the session modes too. The session's model is
+#           switched first and a note is printed, so the persistent change is
+#           visible. Previously rejected with "drop --live/--wait/--raw".
+#   -1  new: raw-ask, one-shot like ask but prints the server's raw JSON body;
+#           ask and raw-ask share oneshot_request so their error handling and
+#           .data.text extraction cannot drift apart
 #   -5  new: check the path against the server instead of scanning its parent,
 #           so mount points are not reported missing; distinguish "absent" from
 #           "could not tell" so a transport failure is never called a missing dir
@@ -145,8 +163,11 @@ selftest() {
     > "$tmpd/server.log" 2>&1 < /dev/null ) &
   pid=$!
 
+  # ASK_SILENCE is bounded deliberately: the prompt checks verify that the text
+  # was recorded, not that the model answered, and a slow or rate-limited model
+  # can otherwise hold each check for the full default budget.
   export OPENCODE_HOST="http://127.0.0.1:$port" OPENCODE_PASS=selftest \
-         SESSIONS_DIR="$tmpd/sessions"
+         SESSIONS_DIR="$tmpd/sessions" ASK_SILENCE=10
 
   # Belt and braces: confirm the test is aimed at the throwaway server before
   # sending anything. If this ever fails, abort rather than touch a real one.
@@ -208,12 +229,23 @@ selftest() {
     mid=$("$0" models 2>/dev/null | head -1 | cut -f1)
     [[ -n "$mid" ]] && "$0" model "$mid" >/dev/null 2>&1
   }
+  # `history` returns only the 3 newest messages. A turn can add more than two
+  # entries (status, assistant parts, tool calls), pushing the user text out of
+  # that slice; the check then failed even though the text arrived whole. Search
+  # the full message array instead.
+  hist_has() {
+    local want=$1 sid
+    sid=$("$0" ls 2>/dev/null | awk 'NR==2{print $2}')
+    [[ -n "$sid" ]] || return 1
+    curl -sS --http1.1 -H "Authorization: Basic $a" \
+      "$OPENCODE_HOST/api/session/$sid/message" 2>/dev/null \
+      | jq -e --arg t "$want" \
+          '[.data[]? | select(.type=="user" and .text==$t)] | length > 0' \
+        >/dev/null 2>&1
+  }
   t_prompt() {
     "$0" ask --wait "$probe" >/dev/null 2>&1 || true
-    # `history` already unwraps .data and slices, so its output is a bare array.
-    "$0" history 2>/dev/null \
-      | jq -e --arg p "$probe" '.[]? | select(.type=="user" and .text==$p)' \
-      >/dev/null 2>&1
+    hist_has "$probe"
   }
 
   # Regression, unquoted on purpose. `text=${1:?...}` took only the first word and
@@ -221,9 +253,7 @@ selftest() {
   # $probe has no spaces, so the check above could never have caught that.
   t_prompt_unquoted() {
     "$0" ask --wait selftest does this arrive whole >/dev/null 2>&1 || true
-    "$0" history 2>/dev/null \
-      | jq -e '.[]? | select(.type=="user" and .text=="selftest does this arrive whole")' \
-      >/dev/null 2>&1
+    hist_has "selftest does this arrive whole"
   }
 
   check "info"              t_info
@@ -569,6 +599,86 @@ session_rm() {
   return $rc
 }
 
+# Point a session at a model. This is a server-side, persistent change: the
+# session keeps the model for later turns. Exits on failure, so a caller can
+# assume success.
+#   $1 session id   $2 model id   $3 provider id
+session_set_model() {
+  local sid=$1 model=$2 provider=$3 resp code body
+  resp=$(post_json "/api/session/$sid/model" \
+    "$(jq -nc --arg id "$model" --arg p "$provider" '{model:{id:$id,providerID:$p}}')")
+  code=${resp##*$'\n'}
+  body=${resp%$'\n'*}
+
+  if [[ "$code" != 2* ]]; then
+    printf 'error: model switch failed (HTTP %s) for %s/%s\n' "$code" "$provider" "$model" >&2
+    printf 'server said: %s\n' "$body" >&2
+    case "$body" in
+      *LocationNotFound*)
+        printf '\nthe session directory does not exist on the server.\n' >&2
+        printf 'create it on the host, then run new again:\n' >&2
+        printf '  ssh <lxc> mkdir -p %s\n' \
+          "$(printf '%s' "$body" | jq -r '.location.directory // empty' 2>/dev/null)" >&2
+        ;;
+      *SessionNotFound*)
+        printf '\nno such session. Run: %s ls\n' "$0" >&2
+        ;;
+      *)
+        printf '\ncheck the id and provider with: %s models %s\n' "$0" "$model" >&2
+        ;;
+    esac
+    exit 1
+  fi
+
+  printf 'session %s now uses %s/%s\n' "$sid" "$provider" "$model"
+}
+
+# One-shot model call, no session. Prints the reply, or the server's raw
+# response body when $4 is "raw".
+#   $1 model id (may be empty)   $2 provider (only used with a model)
+#   $3 prompt text               $4 output: text | raw
+#
+# Shared by `ask` (one-shot default) and `raw-ask`, so the error handling and the
+# .data.text extraction exist once. Splitting them is how the two drifted apart
+# the last time.
+oneshot_request() {
+  local gmodel=$1 gprv=$2 text=$3 out=$4 label=${5:-ask}
+  local areq aresp acode abody aout
+
+  if [[ -n "$gmodel" ]]; then
+    areq=$(jq -nc --arg p "$text" --arg id "$gmodel" \
+      --arg pr "${gprv:-opencode}" \
+      '{prompt:$p, model:{id:$id, providerID:$pr}}')
+  else
+    areq=$(jq -nc --arg p "$text" '{prompt:$p}')
+  fi
+
+  aresp=$(post_json /api/experimental/generate/text "$areq")
+  acode=${aresp##*$'\n'}
+  abody=${aresp%$'\n'*}
+
+  if [[ "$acode" != 2* ]]; then
+    printf 'error: %s failed (HTTP %s)\n' "$label" "$acode" >&2
+    printf 'server said: %s\n' "$abody" >&2
+    return 1
+  fi
+
+  # raw is the response as the server sent it: no .data.text extraction, no
+  # prettifying. Useful when the reply is empty and you need to see why.
+  if [[ "$out" == raw ]]; then
+    printf '%s\n' "$abody"
+    return 0
+  fi
+
+  aout=$(printf '%s' "$abody" | jq -r '.data.text // empty' 2>/dev/null) || true
+  if [[ -z "$aout" ]]; then
+    printf 'error: server returned no text\n' >&2
+    printf 'server said: %s\n' "$abody" >&2
+    return 1
+  fi
+  printf '%s\n' "$aout"
+}
+
 # Send a prompt and render the reply to stdout.
 #   $1 session id   $2 prompt text   $3 mode: live | wait
 # Both modes use event shapes verified against a live server:
@@ -580,10 +690,20 @@ ask_stream() {
   local tmp pid i total consumed=0 line payload etype
   local started=0 finished=0 guard=0 err="" blocked="" stale=0
   local last=$SECONDS
+  # Silence budget in seconds. The original 12s guess was tuned for an agent
+  # waiting on a question, but a slow model emits nothing for just as long, so
+  # the default is looser and ASK_SILENCE overrides it for unusually slow ones.
+  local silence=${ASK_SILENCE:-60}
+  [[ "$silence" =~ ^[0-9]+$ ]] || silence=60
 
   tmp=$(mktemp)
   curl -sSN --http1.1 -H "Authorization: Basic $AUTH" "$OPENCODE_HOST/api/event" > "$tmp" 2>/dev/null &
   pid=$!
+  # A background curl is not in the foreground process group, so Ctrl-C or a
+  # signal to this script leaves it connected to /api/event forever. Kill it on
+  # exit, and on interruption exit with the conventional 130.
+  trap 'kill "$pid" 2>/dev/null || true' EXIT
+  trap 'kill "$pid" 2>/dev/null || true; exit 130' INT TERM
 
   for ((i = 0; i < 100; i++)); do
     grep -q 'server\.connected' "$tmp" && break
@@ -643,17 +763,23 @@ ask_stream() {
     ((finished)) && break
     kill -0 "$pid" 2>/dev/null || break
     # An agent waiting on a question or permission emits nothing while it waits.
-    # Better to report that than hang silently until the guard expires.
-    if ((SECONDS - last > 12)); then
+    # So does a model that has not produced its first token. Give both the budget
+    # and report rather than hang silently until the guard expires.
+    if ((SECONDS - last > silence)); then
       stale=1
       break
     fi
     sleep 0.15
   done
 
-  kill "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+  # Both must tolerate a non-zero status. `wait` on the killed SSE curl returns
+  # 128+SIGTERM (143), which `set -e` turned into an immediate exit — before the
+  # error/blocked/stale checks below and before `return 0`, so a working `ask`
+  # reported failure and every diagnostic after this point was unreachable.
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   rm -f "$tmp"
+  trap - EXIT INT TERM
 
   if [[ -n "$err" ]]; then
     printf 'error: %s\n' "$err" >&2
@@ -665,8 +791,9 @@ ask_stream() {
     return 2
   fi
   if ((stale)); then
-    printf '\nno activity for 12s - agent may be waiting on a question\n' >&2
+    printf '\nno activity for %ss - agent may be waiting on a question, or the model is slow\n' "$silence" >&2
     printf 'inspect with: %s watch\n' "$0" >&2
+    printf 'raise the limit with: ASK_SILENCE=<seconds>\n' >&2
     return 2
   fi
   if ((started == 0)); then
@@ -1266,32 +1393,7 @@ case "${1:-}" in
     model=${2:?usage: $0 model <model-id> [provider-id]}
     provider=${3:-opencode}
     sid=$(sid_of)
-    resp=$(post_json "/api/session/$sid/model" \
-      "$(jq -nc --arg id "$model" --arg p "$provider" '{model:{id:$id,providerID:$p}}')")
-    code=${resp##*$'\n'}
-    body=${resp%$'\n'*}
-
-    if [[ "$code" != 2* ]]; then
-      printf 'error: model switch failed (HTTP %s) for %s/%s\n' "$code" "$provider" "$model" >&2
-      printf 'server said: %s\n' "$body" >&2
-      case "$body" in
-        *LocationNotFound*)
-          printf '\nthe session directory does not exist on the server.\n' >&2
-          printf 'create it on the host, then run new again:\n' >&2
-          printf '  ssh <lxc> mkdir -p %s\n' \
-            "$(printf '%s' "$body" | jq -r '.location.directory // empty' 2>/dev/null)" >&2
-          ;;
-        *SessionNotFound*)
-          printf '\nno such session. Run: %s ls\n' "$0" >&2
-          ;;
-        *)
-          printf '\ncheck the id and provider with: %s models %s\n' "$0" "$model" >&2
-          ;;
-      esac
-      exit 1
-    fi
-
-    printf 'session %s now uses %s/%s\n' "$sid" "$provider" "$model"
+    session_set_model "$sid" "$model" "$provider"
     printf 'note: session-scoped only; new sessions revert to the server default\n'
     ;;
 
@@ -1320,27 +1422,65 @@ case "${1:-}" in
 
   ask)
     shift                     # drop the subcommand; $1 must become the first user arg
-    mode=${ASK_MODE:-live}
-    # Strip any number of leading mode flags, last one wins. Previously only $1
-    # was examined, so `ask --wait --raw "x"` sent the literal text "--raw".
+    # With no mode flag, `ask` is one-shot: POST /api/experimental/generate/text.
+    # No session is created, nothing is tracked, and there is no event stream to
+    # follow. --live/--wait/--raw opt back into the saved session and its stream.
+    mode=${ASK_MODE:-}
+    gmodel="" gprv=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --live) mode=live; shift ;;
         --wait) mode=wait; shift ;;
         --raw)  mode=raw;  shift ;;
-        *) break ;;
+        --model)    gmodel=${2:?--model needs an id};  shift 2 ;;
+        --provider) gprv=${2:?--provider needs an id}; shift 2 ;;
+        --)         shift; break ;;
+        -*)         die "unknown option for ask: $1" ;;
+        *)          break ;;
       esac
     done
     # The message is every remaining word joined. `text=${1:?...}` sent only the
     # first word and discarded the rest with no warning: `ask how are you` asked
     # "how" and dropped the question.
-    (($#)) || die "usage: $0 ask [--live|--wait|--raw] \"your message\""
+    (($#)) || die "usage: $0 ask [--model <id>] [--live|--wait|--raw] \"your message\""
     text="$*"
+
+    if [[ -z "$mode" ]]; then
+      # One-shot, stateless. --model and --provider only mean something here.
+      oneshot_request "$gmodel" "$gprv" "$text" text ask || exit 1
+      exit 0
+    fi
+
     sid=$(sid_of)
+    # In session mode the model belongs to the session, not the request, so
+    # --model has to switch it before streaming. Say so: the change persists.
+    if [[ -n "$gmodel" ]]; then
+      session_set_model "$sid" "$gmodel" "${gprv:-opencode}"
+      printf 'note: the session model changed; it persists for later asks\n'
+    fi
     ask_stream "$sid" "$text" "$mode"
     # Keep the cached count honest for the session just used.
     sf=$(session_file "$sid" 2>/dev/null || true)
     [[ -n "$sf" ]] && session_cache_msgs "$sf" "$(msg_count "$sid")"
+    ;;
+
+  raw-ask)
+    # One-shot, stateless, unrendered. Same endpoint as `ask`, but the response
+    # body is printed exactly as the server sent it instead of extracting
+    # .data.text. No session, no event stream, no history.
+    shift
+    gmodel="" gprv=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --model)    gmodel=${2:?--model needs an id};  shift 2 ;;
+        --provider) gprv=${2:?--provider needs an id}; shift 2 ;;
+        --)         shift; break ;;
+        -*)         die "unknown option for raw-ask: $1" ;;
+        *)          break ;;
+      esac
+    done
+    (($#)) || die "usage: $0 raw-ask [--model <id>] [--provider <id>] \"your message\""
+    oneshot_request "$gmodel" "$gprv" "$*" raw raw-ask
     ;;
 
   history)
