@@ -122,10 +122,12 @@ assert_rc "a malformed payload is dropped, not fatal" 1 \
 section "ask_handle_event reports what it accepted"
 
 # The silence budget is built on this contract: ask_stream resets its timer
-# only when the handler returns 0, so a skipped line must say so. Before
-# this, heartbeats and other sessions' events reset the timer on every line,
-# so a healthy-but-stuck stream kept a dead ask alive and ASK_SILENCE could
-# never fire.
+# only on 0, so every non-0 must mean "not activity for this session".
+# Before this, heartbeats and other sessions' events reset the timer on
+# every line, so a healthy-but-stuck stream kept a dead ask alive and
+# ASK_SILENCE could never fire. 2 exists for server-level events: alive,
+# but not activity, so a server that ever emits repeated unaddressed pings
+# cannot defeat the budget either.
 
 assert_rc "a heartbeat is skipped" 1 \
   ask_handle_event ses_a wait ': heartbeat'
@@ -137,7 +139,7 @@ assert_rc "a malformed payload is skipped" 1 \
   ask_handle_event ses_a wait 'data: not json'
 assert_rc "an event for our session is accepted" 0 \
   ask_handle_event ses_a wait 'data: {"type":"session.text.delta","data":{"sessionID":"ses_a","delta":"x"}}'
-assert_rc "an unaddressed event is accepted" 0 \
+assert_rc "an unaddressed event is alive, not activity" 2 \
   ask_handle_event ses_a wait 'data: {"type":"server.connected"}'
 
 section "ask_handle_event ignores other sessions"
@@ -182,5 +184,15 @@ assert_eq "our completion ends the ask" "1" "$finished"
 
 run_event wait 'data: {"type":"session.execution.failed","data":{"sessionID":"ses_a","error":{"message":"boom"}}}'
 assert_eq "our failure is recorded" "boom" "$err"
+
+section "ask_handle_event marks the stream alive"
+
+# A server-level event must still set started: the connect event is often
+# the only event a dead stream ever sends, and started is what keeps the
+# tail from reporting "no events received" for a stream that did connect.
+# It must not, however, count as a completion.
+run_event wait 'data: {"type":"server.connected"}'
+assert_eq "an unaddressed event sets started" "1" "$started"
+assert_eq "  but does not finish the ask" "0" "$finished"
 
 summary

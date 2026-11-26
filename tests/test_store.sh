@@ -247,6 +247,7 @@ out=$(env -u OPENCODE_HOST -u OPENCODE_PASS SESSIONS_DIR="$SESSIONS_DIR" \
 assert_eq     "it exits zero"                "0" "$rc"
 assert_contains "and switches anyway"        'now using "a"' "$out"
 assert_not_contains "with no unbound crash"  "unbound variable" "$out"
+assert_not_contains "  and no host note, no host to compare" "note:" "$out"
 
 # The fix must not kill the warning the note exists for.
 out=$(OPENCODE_HOST=http://elsewhere:4096 OPENCODE_PASS=x \

@@ -256,12 +256,29 @@ selftest() {
     hist_has "selftest does this arrive whole"
   }
 
+  # Delete end to end, against the live server: exit 0, local record gone,
+  # and no session left behind. session_delete_local has unit tests, but
+  # this is the first check that exercises the whole path - remote delete,
+  # local cleanup, exit code - and a server-side failure here would
+  # otherwise ship as a "successful" delete.
+  t_delete() {
+    local sid body
+    sid=$("$0" new "$tmpd" --as selftest-del 2>/dev/null | awk '/^session id:/{print $3; exit}')
+    [[ -n "$sid" ]] || return 1
+    "$0" delete --session-id "$sid" -y >/dev/null 2>&1 || return 1
+    [[ ! -f "$tmpd"/sessions/selftest-del.json ]] || return 1
+    body=$(curl -sS --http1.1 -H "Authorization: Basic $a" \
+      "$OPENCODE_HOST/api/session/$sid/message" 2>/dev/null) || return 1
+    printf '%s' "$body" | jq -e '._tag? // empty' >/dev/null 2>&1
+  }
+
   check "info"              t_info
   check "new"               t_new
   check "models"            t_models
   check "model switch"      t_model
   check "prompt round-trip" t_prompt
   check "unquoted prompt"   t_prompt_unquoted
+  check "delete round-trip" t_delete
 
   echo
   used=$("$0" ls 2>/dev/null | awk 'NR==2{print $2}')
@@ -713,20 +730,29 @@ event_is_for() {
 # printing into this reply and ending the ask on ITS succeeded event — is
 # what this exists to close.
 #
-# Returns 0 when the line is an accepted event (for this session, or
-# unaddressed, like server.connected) and 1 when it is skipped. The caller
-# resets its silence timer on the 0s only, so heartbeats and other sessions'
-# traffic cannot keep a stuck ask alive.
+# Returns 0 for an event addressed to this session - the only line the
+# caller may reset its silence timer on. 1 for a skipped line (not an
+# event, malformed, or addressed to another session). 2 for an unaddressed
+# server-level event such as server.connected: the stream is alive (started
+# is set), but the event says nothing about this session, so it must not
+# count as activity either. That is what keeps heartbeats, other sessions'
+# traffic and repeated server-level pings from holding a stuck ask alive.
 #   $1 session id   $2 mode: live | wait | raw   $3 the line
 ask_handle_event() {
   local sid=$1 mode=$2 line=$3
-  local payload etype
+  local payload etype esid
   case "$line" in data:*) ;; *) return 1 ;; esac
   payload=${line#data: }
   etype=$(jq -jr '.type // empty' <<< "$payload" 2>/dev/null) || return 1
   [[ -n "$etype" ]] || return 1
   event_is_for "$sid" "$payload" || return 1
   started=1
+  # A payload with no sessionID is server-level (server.connected). The
+  # stream is alive, but the event says nothing about our session, so it
+  # must not reset the silence timer either: a server that ever emits
+  # repeated unaddressed pings would defeat ASK_SILENCE.
+  esid=$(jq -jr '.data.sessionID // empty' <<< "$payload" 2>/dev/null) || return 1
+  [[ -n "$esid" ]] || return 2
   case "$etype" in
     session.text.delta)
       case "$mode" in
@@ -803,9 +829,10 @@ ask_stream() {
 
     if ((total > consumed)); then
       while IFS= read -r line; do
-        # Only an accepted event resets the silence timer. Heartbeats, blank
-        # lines and other sessions' events keep arriving on a healthy, stuck
-        # stream — counting them is exactly how the budget used to die.
+        # Only an event for this session (return 0) resets the silence timer.
+        # Heartbeats, blank lines, other sessions' events and server-level
+        # pings keep arriving on a healthy, stuck stream - counting any of
+        # them is exactly how the budget used to die.
         if ask_handle_event "$sid" "$mode" "$line"; then
           last=$SECONDS
         fi
@@ -852,6 +879,15 @@ ask_stream() {
   if ((started == 0)); then
     printf 'no events received - check the server is up and the session is valid\n' >&2
     return 1
+  fi
+  # Reaching here means the stream went quiet, died or hit the guard without
+  # this session completing. blocked sets finished and was returned above, so
+  # a 0 here is a genuinely unfinished reply - say so, instead of exit 0
+  # with a truncated reply and no word.
+  if ((finished == 0)); then
+    printf '\nthe reply did not finish - the stream dropped, or the run outlived its time guard\n' >&2
+    printf 'inspect with: %s watch\n' "$0" >&2
+    return 2
   fi
   return 0
 }
