@@ -257,10 +257,11 @@ selftest() {
   }
 
   # Delete end to end, against the live server: exit 0, local record gone,
-  # and no session left behind. session_delete_local has unit tests, but
-  # this is the first check that exercises the whole path - remote delete,
-  # local cleanup, exit code - and a server-side failure here would
-  # otherwise ship as a "successful" delete.
+  # and no session left behind. The exit 0 is only reachable through the
+  # dispatcher's success arm (remote delete OK, then session_delete_local),
+  # so this is what pins that flow - which the no-network unit suite cannot
+  # reach - and a server-side failure would otherwise ship as a
+  # "successful" delete.
   t_delete() {
     local sid body
     sid=$("$0" new "$tmpd" --as selftest-del 2>/dev/null | awk '/^session id:/{print $3; exit}')

@@ -107,6 +107,13 @@ assert_eq "last_used lands in its own column" "2026-02-02T00:00:00Z" "$_rlast"
 # this reply, its session.execution.succeeded ended this ask early, and its
 # failure was reported as this session's error. ask now drops every event
 # whose data.sessionID names another session.
+#
+# Scope note: the ask_stream loop that wires these return codes to the
+# silence timer is not unit-tested - it needs a live SSE endpoint and the
+# suite is no-network by contract (tests/README.md). The handler contract
+# below is the unit pin; the loop's completion path is covered by the
+# selftest, and its stale, busy-other and mid-run-drop paths were verified
+# against a local fake SSE server.
 
 section "event_is_for"
 
