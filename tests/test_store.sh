@@ -206,6 +206,54 @@ out=$(OPENCODE_HOST=http://test.invalid:1 OPENCODE_PASS=x \
 assert_contains     "it asks for the name back" "Type it to confirm" "$out"
 assert_not_contains "  and a closed stdin aborts" "local name left in place" "$out"
 
+# ------------------------------------------------------------ delete cleanup
+# Origin: the post-success cleanup in the delete dispatcher used `local` at the
+# top level of the script, where Bash 3.2 rejects it outside a function. A
+# successful delete printed "deleted on server", died with "local: can only be
+# used in a function", exited 1, and left the local record behind — the
+# opposite of the documented behaviour. The cleanup now lives in
+# session_delete_local, where it is testable without a live server.
+
+section "session_delete_local drops the record"
+
+fresh_store
+put_session a ses_a /projects
+session_delete_local ses_a a
+assert_eq "removed by id" "0" "$(ls "$SESSIONS_DIR" | wc -l | tr -d ' ')"
+
+put_session b ses_b /projects
+session_delete_local ses_nosuch b
+assert_eq "removed by name when the id is not a key" "0" \
+      "$(ls "$SESSIONS_DIR" | wc -l | tr -d ' ')"
+
+fresh_store
+put_session c ses_c /projects
+assert_rc "a miss is not an error" 0 session_delete_local ses_nosuch nosuch
+assert_eq "  and leaves the record in place" "c.json" "$(ls "$SESSIONS_DIR")"
+
+# ------------------------------------------------------------ bare shell
+# Origin: use is a local command — no credentials required — but it referenced
+# OPENCODE_HOST unguarded, so a bare shell aborted with "unbound variable"
+# before switching anything. [[ ]] expands every operand, so the crash happened
+# even for a record without a host, where the -n "$h" check would have been
+# enough.
+
+section "use works in a bare shell"
+
+fresh_store
+put_session a ses_a /projects
+out=$(env -u OPENCODE_HOST -u OPENCODE_PASS SESSIONS_DIR="$SESSIONS_DIR" \
+      bash "$TOOL" use a 2>&1); rc=$?
+assert_eq     "it exits zero"                "0" "$rc"
+assert_contains "and switches anyway"        'now using "a"' "$out"
+assert_not_contains "with no unbound crash"  "unbound variable" "$out"
+
+# The fix must not kill the warning the note exists for.
+out=$(OPENCODE_HOST=http://elsewhere:4096 OPENCODE_PASS=x \
+      SESSIONS_DIR="$SESSIONS_DIR" bash "$TOOL" use a 2>&1)
+assert_contains "a host mismatch still warns" \
+      "is on http://test.invalid:4096, not http://elsewhere:4096" "$out"
+
 section "raw dispatch parses its own flags"
 
 # The case tested ${1:-} without shifting, so $1 was still "raw" and -i could

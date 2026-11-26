@@ -101,4 +101,86 @@ assert_eq "model stays empty, not the date" ""        "$_rmodel"
 assert_eq "created does not leak into model" "2026-01-01T00:00:00Z" "$_rcreated"
 assert_eq "last_used lands in its own column" "2026-02-02T00:00:00Z" "$_rlast"
 
+# ------------------------------------------------------------ event filtering
+# Origin: ask_stream consumed the server-wide SSE stream and switched on
+# .type alone, so while a second session was active its deltas rendered into
+# this reply, its session.execution.succeeded ended this ask early, and its
+# failure was reported as this session's error. ask now drops every event
+# whose data.sessionID names another session.
+
+section "event_is_for"
+
+assert_rc "an event for our session passes" 0 \
+  event_is_for ses_a '{"type":"session.text.delta","data":{"sessionID":"ses_a","delta":"x"}}'
+assert_rc "an event for another session is dropped" 1 \
+  event_is_for ses_a '{"type":"session.text.delta","data":{"sessionID":"ses_b","delta":"x"}}'
+assert_rc "an unaddressed event passes through" 0 \
+  event_is_for ses_a '{"type":"server.connected"}'
+assert_rc "a malformed payload is dropped, not fatal" 1 \
+  event_is_for ses_a 'not json'
+
+section "ask_handle_event reports what it accepted"
+
+# The silence budget is built on this contract: ask_stream resets its timer
+# only when the handler returns 0, so a skipped line must say so. Before
+# this, heartbeats and other sessions' events reset the timer on every line,
+# so a healthy-but-stuck stream kept a dead ask alive and ASK_SILENCE could
+# never fire.
+
+assert_rc "a heartbeat is skipped" 1 \
+  ask_handle_event ses_a wait ': heartbeat'
+assert_rc "a blank line is skipped" 1 \
+  ask_handle_event ses_a wait ''
+assert_rc "another session's event is skipped" 1 \
+  ask_handle_event ses_a wait 'data: {"type":"session.text.delta","data":{"sessionID":"ses_b","delta":"x"}}'
+assert_rc "a malformed payload is skipped" 1 \
+  ask_handle_event ses_a wait 'data: not json'
+assert_rc "an event for our session is accepted" 0 \
+  ask_handle_event ses_a wait 'data: {"type":"session.text.delta","data":{"sessionID":"ses_a","delta":"x"}}'
+assert_rc "an unaddressed event is accepted" 0 \
+  ask_handle_event ses_a wait 'data: {"type":"server.connected"}'
+
+section "ask_handle_event ignores other sessions"
+
+# Resets the state the handler updates, then runs it, capturing rendered
+# output into EV_OUT. The handler must run in THIS shell: $(...) would run it
+# in a subshell and its updates to started/finished/err/blocked would vanish,
+# making every state assertion pass for the wrong reason.
+run_event() {
+  started=0; finished=0; err=""; blocked=""
+  local tmpo
+  tmpo=$(mktemp)
+  ask_handle_event ses_a "$1" "$2" > "$tmpo" 2>/dev/null
+  EV_OUT=$(cat "$tmpo")
+  rm -f "$tmpo"
+}
+
+run_event live 'data: {"type":"session.text.delta","data":{"sessionID":"ses_b","delta":"other session text"}}'
+assert_eq   "another session's delta does not render" "" "$EV_OUT"
+assert_eq   "  and does not start our stream"         "0" "$started"
+
+run_event wait 'data: {"type":"session.execution.succeeded","data":{"sessionID":"ses_b"}}'
+assert_eq "another session finishing does not end this ask" "0" "$finished"
+
+run_event wait 'data: {"type":"session.execution.failed","data":{"sessionID":"ses_b","error":{"message":"boom"}}}'
+assert_eq "another session's failure is not ours" "" "$err"
+
+run_event wait 'data: {"type":"session.permission.requested","data":{"sessionID":"ses_b"}}'
+assert_eq "another session's prompt does not block this ask" "" "$blocked"
+
+run_event raw 'data: {"type":"session.text.delta","data":{"sessionID":"ses_b","delta":"x"}}'
+assert_eq "raw mode does not leak other sessions" "" "$EV_OUT"
+
+section "ask_handle_event still serves our session"
+
+run_event live 'data: {"type":"session.text.delta","data":{"sessionID":"ses_a","delta":"hello"}}'
+assert_eq   "our delta renders"          "hello" "$EV_OUT"
+assert_eq   "  and starts our stream"    "1" "$started"
+
+run_event wait 'data: {"type":"session.execution.succeeded","data":{"sessionID":"ses_a"}}'
+assert_eq "our completion ends the ask" "1" "$finished"
+
+run_event wait 'data: {"type":"session.execution.failed","data":{"sessionID":"ses_a","error":{"message":"boom"}}}'
+assert_eq "our failure is recorded" "boom" "$err"
+
 summary
