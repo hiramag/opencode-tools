@@ -422,9 +422,19 @@ history. Use them when the request needs tools, project files, or earlier turns.
 `ASK_MODE` in the environment selects a session mode when no flag is given. Leave
 it unset for the one-shot default.
 
-`ASK_SILENCE` applies to the session modes: how many seconds of event silence `ask`
-tolerates before giving up with exit status 2 (default `60`). Raise it for a slow
-model: `ASK_SILENCE=120 ./opencode-bash-tool.sh ask --wait "your message"`.
+`ASK_SILENCE` applies to the session modes: how many seconds without an event
+for *this session* `ask` tolerates before giving up with exit status 2
+(default `60`). Heartbeats, other sessions' traffic and server-level events
+do not count, so a busy second session cannot keep a stuck ask alive. Raise
+it for a slow model:
+`ASK_SILENCE=120 ./opencode-bash-tool.sh ask --wait "your message"`.
+
+The session modes exit 2, with a reason printed, in three cases: the silence
+budget ran out; the agent is waiting on input (a question or a permission);
+or the reply did not finish - the stream dropped, or the run outlived its
+time guard. The last case is deliberate: a truncated reply is now a visible
+failure instead of a silent exit 0. A server error, or a session that never
+produced an event, exits 1.
 
 `--model` works here too, but differently. In the one-shot form it applies to that
 call. In a session mode the model belongs to the session, so the script switches

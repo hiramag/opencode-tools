@@ -256,12 +256,30 @@ selftest() {
     hist_has "selftest does this arrive whole"
   }
 
+  # Delete end to end, against the live server: exit 0, local record gone,
+  # and no session left behind. The exit 0 is only reachable through the
+  # dispatcher's success arm (remote delete OK, then session_delete_local),
+  # so this is what pins that flow - which the no-network unit suite cannot
+  # reach - and a server-side failure would otherwise ship as a
+  # "successful" delete.
+  t_delete() {
+    local sid body
+    sid=$("$0" new "$tmpd" --as selftest-del 2>/dev/null | awk '/^session id:/{print $3; exit}')
+    [[ -n "$sid" ]] || return 1
+    "$0" delete --session-id "$sid" -y >/dev/null 2>&1 || return 1
+    [[ ! -f "$tmpd"/sessions/selftest-del.json ]] || return 1
+    body=$(curl -sS --http1.1 -H "Authorization: Basic $a" \
+      "$OPENCODE_HOST/api/session/$sid/message" 2>/dev/null) || return 1
+    printf '%s' "$body" | jq -e '._tag? // empty' >/dev/null 2>&1
+  }
+
   check "info"              t_info
   check "new"               t_new
   check "models"            t_models
   check "model switch"      t_model
   check "prompt round-trip" t_prompt
   check "unquoted prompt"   t_prompt_unquoted
+  check "delete round-trip" t_delete
 
   echo
   used=$("$0" ls 2>/dev/null | awk 'NR==2{print $2}')
@@ -297,6 +315,17 @@ session_delete_remote() {
   printf 'server refused the delete (HTTP %s)\n' "$code" >&2
   [[ -n "$body" ]] && printf 'server said: %s\n' "$body" >&2
   return 1
+}
+
+# Drop the local record after the server-side delete has succeeded. Matched by
+# id first, then by name, so both delete forms land here.
+#   $1 session id   $2 the name (or id) the user typed
+session_delete_local() {
+  local sid=$1 name=$2 f
+  f=$(session_file "$sid" 2>/dev/null || session_file "$name" 2>/dev/null || true)
+  # An if, not `[[ -n ]] && rm`: with no record to drop the function must still
+  # return 0, or set -e turns a successful delete into an error.
+  if [[ -n "$f" ]]; then rm -f "$f"; fi
 }
 
 usage() {
@@ -428,8 +457,12 @@ session_use() {
   name=$(basename "$f" .json)
   h=$(jq -r '.host // ""' "$f")
   # A name is local; the session is not. Pointing at another server should say so.
-  [[ -n "$h" && "$h" != "$OPENCODE_HOST" ]] \
-    && printf 'note: "%s" is on %s, not %s\n' "$name" "$h" "$OPENCODE_HOST" >&2
+  # ${OPENCODE_HOST:-} on purpose: use is a local command and may run in a bare
+  # shell where the variable is unset, and [[ ]] expands every operand, so an
+  # unguarded reference dies under set -u before the -n "$h" check can help.
+  if [[ -n "$h" && -n "${OPENCODE_HOST:-}" && "$h" != "${OPENCODE_HOST:-}" ]]; then
+    printf 'note: "%s" is on %s, not %s\n' "$name" "$h" "$OPENCODE_HOST" >&2
+  fi
   session_touch "$f"
   printf 'now using "%s"  %s\n' "$name" "$(jq -r .id "$f")"
 }
@@ -679,15 +712,88 @@ oneshot_request() {
   printf '%s\n' "$aout"
 }
 
+# Does this event (a JSON payload) belong to session $1?
+# An event with no sessionID (server.connected) belongs to no session and
+# passes through: the stream is alive even when it says nothing to us.
+#   $1 session id   $2 event payload
+event_is_for() {
+  local esid
+  esid=$(jq -jr '.data.sessionID // empty' <<< "$2" 2>/dev/null) || return 1
+  [[ -z "$esid" || "$esid" == "$1" ]]
+}
+
+# Handle one SSE line for session $1 in mode $2, updating the caller's
+# started/finished/err/blocked and writing rendered output to stdout.
+#
+# The stream is server-wide: most lines belong to other sessions. An event
+# addressed elsewhere must not render as this reply, end it, record its
+# error, or count as activity for it. That leak — a busy second session
+# printing into this reply and ending the ask on ITS succeeded event — is
+# what this exists to close.
+#
+# Returns 0 for an event addressed to this session - the only line the
+# caller may reset its silence timer on. 1 for a skipped line (not an
+# event, malformed, or addressed to another session). 2 for an unaddressed
+# server-level event such as server.connected: the stream is alive (started
+# is set), but the event says nothing about this session, so it must not
+# count as activity either. That is what keeps heartbeats, other sessions'
+# traffic and repeated server-level pings from holding a stuck ask alive.
+#   $1 session id   $2 mode: live | wait | raw   $3 the line
+ask_handle_event() {
+  local sid=$1 mode=$2 line=$3
+  local payload etype esid
+  case "$line" in data:*) ;; *) return 1 ;; esac
+  payload=${line#data: }
+  etype=$(jq -jr '.type // empty' <<< "$payload" 2>/dev/null) || return 1
+  [[ -n "$etype" ]] || return 1
+  event_is_for "$sid" "$payload" || return 1
+  started=1
+  # A payload with no sessionID is server-level (server.connected). The
+  # stream is alive, but the event says nothing about our session, so it
+  # must not reset the silence timer either: a server that ever emits
+  # repeated unaddressed pings would defeat ASK_SILENCE.
+  esid=$(jq -jr '.data.sessionID // empty' <<< "$payload" 2>/dev/null) || return 1
+  [[ -n "$esid" ]] || return 2
+  case "$etype" in
+    session.text.delta)
+      case "$mode" in
+        raw)  printf '%s\n' "$line" ;;
+        live) jq -jr '.data.delta // empty' <<< "$payload" ;;
+      esac
+      ;;
+    session.text.ended)
+      if [[ "$mode" == raw ]]; then
+        printf '%s\n' "$line"
+      else
+        printf '\n'
+        [[ "$mode" == wait ]] && { jq -jr '.data.text // empty' <<< "$payload"; printf '\n'; }
+      fi
+      ;;
+    session.step.failed|session.execution.failed)
+      err=$(jq -jr '.data.error.message // .data.error.type // "unknown error"' <<< "$payload" 2>/dev/null)
+      ;;
+    session.execution.succeeded)
+      finished=1
+      ;;
+    *form*|*permission*)
+      blocked=$etype
+      finished=1
+      ;;
+  esac
+  return 0
+}
+
 # Send a prompt and render the reply to stdout.
 #   $1 session id   $2 prompt text   $3 mode: live | wait
 # Both modes use event shapes verified against a live server:
 #   session.text.delta  -> .data.delta  (incremental)
 #   session.text.ended  -> .data.text   (complete)
 # Subscribes BEFORE prompting so no event is missed in between.
+# Lines are routed through ask_handle_event, which drops events that belong
+# to other sessions.
 ask_stream() {
   local sid=$1 text=$2 mode=$3
-  local tmp pid i total consumed=0 line payload etype
+  local tmp pid i total consumed=0 line
   local started=0 finished=0 guard=0 err="" blocked="" stale=0
   local last=$SECONDS
   # Silence budget in seconds. The original 12s guess was tuned for an agent
@@ -724,40 +830,15 @@ ask_stream() {
 
     if ((total > consumed)); then
       while IFS= read -r line; do
-        case "$line" in data:*) ;; *) continue ;; esac
-        payload=${line#data: }
-        etype=$(jq -jr '.type // empty' <<< "$payload" 2>/dev/null) || continue
-        [[ -n "$etype" ]] || continue
-        started=1
-        case "$etype" in
-          session.text.delta)
-            case "$mode" in
-              raw)  printf '%s\n' "$line" ;;
-              live) jq -jr '.data.delta // empty' <<< "$payload" ;;
-            esac
-            ;;
-          session.text.ended)
-            if [[ "$mode" == raw ]]; then
-              printf '%s\n' "$line"
-            else
-              printf '\n'
-              [[ "$mode" == wait ]] && { jq -jr '.data.text // empty' <<< "$payload"; printf '\n'; }
-            fi
-            ;;
-          session.step.failed|session.execution.failed)
-            err=$(jq -jr '.data.error.message // .data.error.type // "unknown error"' <<< "$payload" 2>/dev/null)
-            ;;
-          session.execution.succeeded)
-            finished=1
-            ;;
-          *form*|*permission*)
-            blocked=$etype
-            finished=1
-            ;;
-        esac
+        # Only an event for this session (return 0) resets the silence timer.
+        # Heartbeats, blank lines, other sessions' events and server-level
+        # pings keep arriving on a healthy, stuck stream - counting any of
+        # them is exactly how the budget used to die.
+        if ask_handle_event "$sid" "$mode" "$line"; then
+          last=$SECONDS
+        fi
       done < <(sed -n "$((consumed + 1)),${total}p" "$tmp")
       consumed=$total
-      last=$SECONDS
     fi
 
     ((finished)) && break
@@ -799,6 +880,15 @@ ask_stream() {
   if ((started == 0)); then
     printf 'no events received - check the server is up and the session is valid\n' >&2
     return 1
+  fi
+  # Reaching here means the stream went quiet, died or hit the guard without
+  # this session completing. blocked sets finished and was returned above, so
+  # a 0 here is a genuinely unfinished reply - say so, instead of exit 0
+  # with a truncated reply and no word.
+  if ((finished == 0)); then
+    printf '\nthe reply did not finish - the stream dropped, or the run outlived its time guard\n' >&2
+    printf 'inspect with: %s watch\n' "$0" >&2
+    return 2
   fi
   return 0
 }
@@ -1374,9 +1464,7 @@ case "${1:-}" in
     if session_delete_remote "$dsid"; then
       printf 'deleted on server: %s\n' "$dsid"
       # Drop the local record too, matched by name or by id.
-      local lf
-      lf=$(session_file "$dsid" 2>/dev/null || session_file "$dtarget" 2>/dev/null || true)
-      [[ -n "$lf" ]] && rm -f "$lf"
+      session_delete_local "$dsid" "$dtarget"
       exit 0
     fi
     printf 'local name left in place; retry or use: %s rm %s\n' "$0" "$dtarget" >&2
